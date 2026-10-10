@@ -1,21 +1,30 @@
 /* =========================================================================
- * Social Automator v2.0
+ * Instagram Automator v2.2
  * -------------------------------------------------------------------------
  * A self-contained, vanilla-JS console / userscript automator for
- * follow / unfollow workflows.
+ * Instagram follow / unfollow workflows.
  *
  * No build step, no external dependencies. Paste into the browser console,
  * or load as a userscript. A floating control panel is injected into the
  * page automatically.
  *
  * Features
+ *   - Direct Instagram API sync for Followers / Following lists (deterministic,
+ *     no DOM scraping, no virtual-list timing issues).
+ *   - DOM fallback if the API is unavailable (missing cookies, rate-limit).
+ *   - Unfollow Non-Followers action that auto-blacklists each unfollowed
+ *     account in one click.
  *   - Follow loop with human-like click simulation and randomized jitter.
  *   - Shadow rate-limit / silent-rollback detection with audio alert.
- *   - Unfollow loop that only targets non-followers older than 24h and
- *     never touches mutual followers.
- *   - Persistent blacklist, follow history and per-day statistics.
+ *   - Unfollow loop that targets every non-follower (auto-blacklists each
+ *     one) and always protects mutual followers.
+ *   - Persistent blacklist, follow/following history, per-day statistics
+ *     (follows and unfollows tracked separately; daily cap applies to
+ *     each independently).
  *   - Configurable session target, daily cap, batch size and batch delay.
  *   - Safe Mode / Fast Mode presets.
+ *   - 3-step guided UI (Sync, Blacklist, Automate) with optional verbose
+ *     logging for debugging.
  *
  * License: MIT
  * ========================================================================= */
@@ -27,8 +36,8 @@
   /* ------------------------------------------------------------------ */
   if (window.SA_Automator) return; // Prevent double injection.
 
-  const VERSION = '2.0';
-  const TITLE = 'Social Automator v' + VERSION;
+  const VERSION = '2.2';
+  const TITLE = 'Instagram Automator v' + VERSION;
 
   /* ------------------------------------------------------------------ */
   /* 1. CONFIG                                                           */
@@ -50,18 +59,18 @@
 
   // Presets. "custom" deliberately keeps whatever is currently configured.
   const PRESETS = {
-    safe: { actionsBatchSize: 6, waitAfterFiveActions: 150000, maxDailyActions: 100 },
-    fast: { actionsBatchSize: 10, waitAfterFiveActions: 90000, maxDailyActions: 150 },
+    safe: { sessionTarget: 20, actionsBatchSize: 6, waitAfterFiveActions: 300000, maxDailyActions: 100 },
+    fast: { sessionTarget: 0, actionsBatchSize: 10, waitAfterFiveActions: 90000, maxDailyActions: 150 },
     custom: null
   };
 
   // Persisted defaults for the settings drawer.
   const DEFAULT_SETTINGS = {
     preset: 'safe',
-    sessionTarget: 0,
+    sessionTarget: 20,
     maxDailyActions: 100,
     actionsBatchSize: 6,
-    waitAfterFiveActions: 150000
+    waitAfterFiveActions: 300000
   };
 
   // Text shown by the platform when an action has been throttled.
@@ -90,6 +99,28 @@
   // Labels that indicate the follow did NOT stick (silent rollback).
   const FOLLOW_FAILURE_LABELS = ['follow'];
 
+  // Paths that are never user profiles and must be ignored during extraction.
+  const RESERVED_PATHS = ['p', 'explore', 'reel', 'stories', 'accounts', 'direct', 'about', 'directory'];
+
+  // Internal friendships API. Used to page through followers/following
+  // deterministically (50 users per request) instead of scraping the
+  // virtualized DOM list.
+  const IG_API = {
+    appId: '936619743392459',
+    asbdId: '129477',
+    count: 200,
+    maxPages: 60
+  };
+
+  // Extract a username from an anchor href ("/someuser/" -> "someuser").
+  // Returns null for links that are not profile permalinks.
+  function usernameFromHref(href) {
+    const clean = (href || '').replace(/^https?:\/\/[^\/]+/, '').split('?')[0].split('#')[0];
+    const m = clean.match(/^\/([A-Za-z0-9._]+)\/?$/);
+    if (m && m[1] && RESERVED_PATHS.indexOf(m[1]) === -1) return m[1];
+    return null;
+  }
+
   /* ------------------------------------------------------------------ */
   /* 2. STATE MANAGEMENT (localStorage)                                  */
   /* ------------------------------------------------------------------ */
@@ -98,6 +129,8 @@
     history: 'sa_follow_history',
     stats: 'sa_daily_stats',
     myFollowers: 'sa_my_followers',
+    following: 'sa_my_following',
+    lastSync: 'sa_last_sync',
     settings: 'sa_settings'
   };
 
@@ -152,6 +185,27 @@
       return arr;
     },
 
+    getMyFollowing() {
+      const arr = readJSON(KEYS.following, []);
+      return new Set(Array.isArray(arr) ? arr : []);
+    },
+    setMyFollowing(array) {
+      const arr = Array.isArray(array) ? array : Array.from(array || []);
+      writeJSON(KEYS.following, arr);
+      return arr;
+    },
+
+    getLastSync() {
+      const obj = readJSON(KEYS.lastSync, {});
+      return obj && typeof obj === 'object' ? obj : {};
+    },
+    setLastSync(kind, ts) {
+      const obj = Store.getLastSync();
+      obj[kind] = ts;
+      writeJSON(KEYS.lastSync, obj);
+      return obj;
+    },
+
     /* ---- follow history (username -> timestamp) ---- */
     getHistory() {
       const obj = readJSON(KEYS.history, {});
@@ -174,16 +228,31 @@
       let stats = readJSON(KEYS.stats, null);
       const today = todayStr();
       if (!stats || stats.date !== today) {
-        stats = { date: today, count: 0 };
+        stats = { date: today, follows: 0, unfollows: 0 };
+        writeJSON(KEYS.stats, stats);
+        return stats;
+      }
+      // Migrate legacy { count } schema once.
+      if (typeof stats.follows !== 'number' || typeof stats.unfollows !== 'number') {
+        const legacyCount = typeof stats.count === 'number' ? stats.count : 0;
+        stats.follows = 0;
+        stats.unfollows = legacyCount;
+        delete stats.count;
         writeJSON(KEYS.stats, stats);
       }
       return stats;
     },
-    incrementStats() {
+    incrementFollows() {
       const stats = Store.getStats();
-      stats.count += 1;
+      stats.follows += 1;
       writeJSON(KEYS.stats, stats);
-      return stats.count;
+      return stats.follows;
+    },
+    incrementUnfollows() {
+      const stats = Store.getStats();
+      stats.unfollows += 1;
+      writeJSON(KEYS.stats, stats);
+      return stats.unfollows;
     },
 
     /* ---- settings ---- */
@@ -201,7 +270,8 @@
   /* ------------------------------------------------------------------ */
   const UI = (function () {
     let panel, logBox, statusLine, todayLine, countdownLine, warningLine;
-    let followBtn, unfollowBtn, scanBtn, stopBtn, blackBtn, settingsToggle, settingsBox;
+    let followBtn, unfollowBtn, stopBtn, blackBtn, settingsToggle, settingsBox;
+    let syncFollowersBtn, syncFollowingBtn, advancedToggle, advancedBox, syncStatusLine, networkLine;
     let presetSelect, sessionTargetInput, dailyCapInput, batchSizeInput, batchDelayInput, capWarning;
     let maxLogs = 60;
 
@@ -229,6 +299,8 @@
         boxShadow: '0 8px 30px rgba(0,0,0,.55)',
         padding: '12px',
         boxSizing: 'border-box',
+        maxHeight: 'calc(100vh - 32px)',
+        overflowY: 'auto',
         userSelect: 'none'
       });
 
@@ -245,46 +317,87 @@
       header.appendChild(minimize);
       panel.appendChild(header);
 
-      /* ---- action buttons ---- */
-      const btnWrap = document.createElement('div');
-      style(btnWrap, { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px', marginBottom: '8px' });
-
-      followBtn = mkButton('[Start Follow Loop]', '#1f9d55');
-      unfollowBtn = mkButton('[Start Unfollow >24h]', '#d97706');
-      scanBtn = mkButton('[Scan My Followers]', '#2563eb');
-      stopBtn = mkButton('[Stop / Pause]', '#c53030');
-      blackBtn = mkButton('[Export / Clear Blacklist]', '#334155');
-      settingsToggle = mkButton('[Settings]', '#475569');
-
-      btnWrap.appendChild(followBtn);
-      btnWrap.appendChild(unfollowBtn);
-      scanBtn.style.gridColumn = '1 / span 2';
-      stopBtn.style.gridColumn = '1 / span 2';
-      settingsToggle.style.gridColumn = '1 / span 2';
-      blackBtn.style.gridColumn = '1 / span 2';
-      btnWrap.appendChild(scanBtn);
-      btnWrap.appendChild(stopBtn);
-      btnWrap.appendChild(settingsToggle);
-      btnWrap.appendChild(blackBtn);
-      panel.appendChild(btnWrap);
-
-      /* ---- status lines ---- */
+      /* ---- status block ---- */
       statusLine = document.createElement('div');
       style(statusLine, { marginBottom: '4px', color: '#9fe6b3', minHeight: '15px', lineHeight: '1.35' });
+      networkLine = document.createElement('div');
+      style(networkLine, { marginBottom: '4px', color: '#c7ccd6', lineHeight: '1.35' });
+      networkLine.textContent = 'Following: -  \u00b7  Followers: -';
       todayLine = document.createElement('div');
       style(todayLine, { marginBottom: '4px', color: '#8b93a1' });
-      countdownLine = document.createElement('div');
-      style(countdownLine, { marginBottom: '6px', color: '#ffd166', fontWeight: '600' });
-      warningLine = document.createElement('div');
-      style(warningLine, {
-        marginBottom: '6px', color: '#ff5c5c', fontWeight: '700', display: 'none',
-        background: 'rgba(255,92,92,.12)', border: '1px solid rgba(255,92,92,.4)',
-        borderRadius: '6px', padding: '6px', lineHeight: '1.35'
+      panel.appendChild(statusLine);
+      panel.appendChild(networkLine);
+      panel.appendChild(todayLine);
+
+      /* ---- STEP 1: sync your lists ---- */
+      const step1Block = document.createElement('div');
+      step1Block.appendChild(mkSectionTitle('STEP 1 \u00b7 SYNC YOUR LISTS'));
+      const syncWrap = document.createElement('div');
+      style(syncWrap, { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' });
+      syncFollowersBtn = mkButton('[Sync Followers]', '#2563eb');
+      syncFollowingBtn = mkButton('[Sync Following]', '#2563eb');
+      syncWrap.appendChild(syncFollowersBtn);
+      syncWrap.appendChild(syncFollowingBtn);
+      step1Block.appendChild(syncWrap);
+      syncStatusLine = document.createElement('div');
+      style(syncStatusLine, { color: '#8b93a1', fontSize: '10px', marginTop: '4px' });
+      syncStatusLine.textContent = 'Followers: never \u00b7 Following: never';
+      step1Block.appendChild(syncStatusLine);
+      panel.appendChild(step1Block);
+
+      /* ---- STEP 2: automate ---- */
+      const step3Block = document.createElement('div');
+      step3Block.appendChild(mkSectionTitle('STEP 2 \u00b7 AUTOMATE'));
+      const actWrap = document.createElement('div');
+      style(actWrap, { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' });
+      followBtn = mkButton('[Start Follow Loop]', '#1f9d55');
+      unfollowBtn = mkButton('[Unfollow Non-Followers]', '#d97706');
+      actWrap.appendChild(followBtn);
+      actWrap.appendChild(unfollowBtn);
+      step3Block.appendChild(actWrap);
+      panel.appendChild(step3Block);
+
+      /* ---- stop (full width, red) ---- */
+      stopBtn = mkButton('[Stop / Pause]', '#c53030');
+      style(stopBtn, { width: '100%', marginTop: '8px' });
+      panel.appendChild(stopBtn);
+
+      /* ---- advanced toggle + drawer ---- */
+      advancedToggle = mkButton('[\u25be Advanced]', '#334155');
+      style(advancedToggle, { width: '100%', marginTop: '6px', opacity: '0.8' });
+      panel.appendChild(advancedToggle);
+
+      advancedBox = document.createElement('div');
+      style(advancedBox, {
+        display: 'none', background: '#0d0f12', border: '1px solid #23262d',
+        borderRadius: '8px', padding: '8px', marginTop: '6px',
+        maxHeight: '55vh', overflowY: 'auto', paddingRight: '4px'
       });
+
+      settingsToggle = mkButton('[Settings]', '#475569');
+      style(settingsToggle, { width: '100%', marginBottom: '6px' });
+
+      const advancedRow = document.createElement('div');
+      style(advancedRow, { marginBottom: '6px' });
+      const verboseCheckbox = document.createElement('input');
+      verboseCheckbox.type = 'checkbox';
+      verboseCheckbox.id = 'sa-verbose';
+      const verboseLabel = document.createElement('label');
+      verboseLabel.htmlFor = 'sa-verbose';
+      verboseLabel.textContent = 'Show debug logs';
+      style(verboseLabel, { color: '#8b93a1', fontSize: '10px', marginLeft: '6px', cursor: 'pointer' });
+      verboseCheckbox.addEventListener('change', function () { setVerbose(verboseCheckbox.checked); });
+      advancedRow.appendChild(verboseCheckbox);
+      advancedRow.appendChild(verboseLabel);
+
+      blackBtn = mkButton('[Export / Clear Blacklist]', '#334155');
+      style(blackBtn, { width: '100%' });
+
+      settingsBox = buildSettingsBox();
 
       /* ---- manual blacklist ---- */
       const blWrap = document.createElement('div');
-      style(blWrap, { display: 'flex', gap: '6px', marginBottom: '6px' });
+      style(blWrap, { display: 'flex', gap: '6px', marginTop: '6px' });
       const blInput = document.createElement('input');
       blInput.type = 'text';
       blInput.placeholder = 'username without @';
@@ -312,8 +425,24 @@
       blWrap.appendChild(blInput);
       blWrap.appendChild(blBtn);
 
-      /* ---- settings drawer ---- */
-      settingsBox = buildSettingsBox();
+      advancedBox.appendChild(settingsToggle);
+      advancedBox.appendChild(settingsBox);
+      advancedBox.appendChild(blackBtn);
+      advancedBox.appendChild(advancedRow);
+      advancedBox.appendChild(blWrap);
+      panel.appendChild(advancedBox);
+
+      /* ---- countdown / warning ---- */
+      countdownLine = document.createElement('div');
+      style(countdownLine, { marginTop: '6px', marginBottom: '6px', color: '#ffd166', fontWeight: '600' });
+      warningLine = document.createElement('div');
+      style(warningLine, {
+        marginBottom: '6px', color: '#ff5c5c', fontWeight: '700', display: 'none',
+        background: 'rgba(255,92,92,.12)', border: '1px solid rgba(255,92,92,.4)',
+        borderRadius: '6px', padding: '6px', lineHeight: '1.35'
+      });
+      panel.appendChild(countdownLine);
+      panel.appendChild(warningLine);
 
       /* ---- log box ---- */
       logBox = document.createElement('div');
@@ -322,13 +451,6 @@
         border: '1px solid #23262d', borderRadius: '8px', padding: '6px',
         lineHeight: '1.4', color: '#c7ccd6', whiteSpace: 'pre-wrap'
       });
-
-      panel.appendChild(statusLine);
-      panel.appendChild(todayLine);
-      panel.appendChild(countdownLine);
-      panel.appendChild(warningLine);
-      panel.appendChild(settingsBox);
-      panel.appendChild(blWrap);
       panel.appendChild(logBox);
       document.body.appendChild(panel);
 
@@ -345,6 +467,13 @@
         settingsBox.style.display = open ? 'none' : 'block';
         settingsToggle.textContent = open ? '[Settings]' : '[Hide Settings]';
       });
+    }
+
+    function mkSectionTitle(text) {
+      const d = document.createElement('div');
+      d.textContent = text;
+      style(d, { color: '#8b93a1', fontSize: '10px', letterSpacing: '.5px', margin: '8px 0 4px' });
+      return d;
     }
 
     /* ---- settings drawer construction ---- */
@@ -435,6 +564,9 @@
     function applyPreset(name, persist) {
       const preset = PRESETS[name];
       if (preset) {
+        if (typeof preset.sessionTarget === 'number' && sessionTargetInput) {
+          sessionTargetInput.value = String(preset.sessionTarget);
+        }
         batchSizeInput.value = String(preset.actionsBatchSize);
         batchDelayInput.value = String(Math.round(preset.waitAfterFiveActions / 1000));
         dailyCapInput.value = String(preset.maxDailyActions);
@@ -524,13 +656,52 @@
     }
     function updateToday() {
       const s = Store.getStats();
-      if (todayLine) todayLine.textContent = 'Today: ' + s.count + ' / ' + CONFIG.maxDailyActions;
+      if (todayLine) {
+        todayLine.textContent = 'Today: ' + s.follows + '/' + CONFIG.maxDailyActions + ' follows  \u00b7  ' + s.unfollows + ' unfollows';
+      }
+      updateNetworkCounts();
+      updateSyncStatus();
     }
+
+    function updateNetworkCounts() {
+      const f = Store.getMyFollowers().size;
+      const g = Store.getMyFollowing().size;
+      const nf = g > 0 && f > 0 ? Math.max(0, g - f) : 0;
+      if (networkLine) {
+        networkLine.textContent = 'Following: ' + (g || '-') + '  \u00b7  Followers: ' + (f || '-') + (nf ? '  \u00b7  Non-followers: ' + nf : '');
+      }
+    }
+    function updateSyncStatus() {
+      if (!syncStatusLine) return;
+      const s = Store.getLastSync();
+      const fmt = ts => {
+        if (!ts) return 'never';
+        const d = Math.floor((Date.now() - ts) / 1000);
+        if (d < 60) return d + 's ago';
+        if (d < 3600) return Math.floor(d / 60) + 'm ago';
+        if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+        return Math.floor(d / 86400) + 'd ago';
+      };
+      syncStatusLine.textContent = 'Followers: ' + fmt(s.followers) + ' \u00b7 Following: ' + fmt(s.following);
+    }
+
+    let verbose = false;
+    function setVerbose(on) { verbose = !!on; if (logBox) logBox.style.borderColor = verbose ? '#4d6bfe' : '#23262d'; }
+    function isVerbose() { return verbose; }
+
     function log(msg) {
+      appendLog(msg, false);
+    }
+    function logDebug(msg) {
+      if (!verbose) return;
+      appendLog(msg, true);
+    }
+    function appendLog(msg, isDebug) {
       if (!logBox) return;
       const t = new Date().toLocaleTimeString();
       const line = document.createElement('div');
       line.textContent = '[' + t + '] ' + msg;
+      if (isDebug) line.style.color = '#6b7280';
       logBox.appendChild(line);
       while (logBox.childNodes.length > maxLogs) logBox.removeChild(logBox.firstChild);
       logBox.scrollTop = logBox.scrollHeight;
@@ -538,12 +709,16 @@
 
     return {
       build, loadSettings, applyPreset, setStatus, setCountdown, setWarning, updateToday, log,
+      setVerbose, isVerbose, logDebug, updateNetworkCounts, updateSyncStatus,
+      get advancedBox() { return advancedBox; },
       buttons: {
         get follow() { return followBtn; },
         get unfollow() { return unfollowBtn; },
-        get scan() { return scanBtn; },
         get stop() { return stopBtn; },
-        get black() { return blackBtn; }
+        get black() { return blackBtn; },
+        get syncFollowers() { return syncFollowersBtn; },
+        get syncFollowing() { return syncFollowingBtn; },
+        get advancedToggle() { return advancedToggle; }
       }
     };
   })();
@@ -613,16 +788,13 @@
 
     // Best-effort extraction of a username from a button's surrounding DOM.
     usernameFor(el) {
-      const reserved = ['p', 'explore', 'reel', 'stories', 'accounts', 'direct', 'about', 'directory'];
       let node = el;
       let depth = 0;
       while (node && depth < 8) {
         const anchors = node.querySelectorAll ? node.querySelectorAll('a[href]') : [];
         for (const a of anchors) {
-          const href = a.getAttribute('href') || '';
-          const clean = href.replace(/^https?:\/\/[^\/]+/, '');
-          const m = clean.match(/^\/([A-Za-z0-9._]+)\/?$/);
-          if (m && m[1] && reserved.indexOf(m[1]) === -1) return m[1];
+          const username = usernameFromHref(a.getAttribute('href'));
+          if (username) return username;
         }
         const imgs = node.querySelectorAll ? node.querySelectorAll('img[alt]') : [];
         for (const img of imgs) {
@@ -646,30 +818,46 @@
       return CONFIG.actionDelayMin + Math.floor(Math.random() * span);
     },
 
-    /* ---- raw incremental scroll with jiggle fallback ---- */
-    // Advances the list by a fixed pixel amount so the platform's lazy
-    // loader keeps fetching rows. When the list bound is reached the
-    // scroll position is jiggled to nudge loaders that stall in
-    // background tabs.
-    async incrementalScroll(scroller) {
-      if (!scroller) return false;
-      const before = scroller.scrollTop;
-      scroller.scrollTop += 550;
+    /* ---- scroll reset (virtualization compliant) ---- */
+    // Snap the list back to the very top and give React time to mount and
+    // paint the first batch of rows before any scanning/actioning begins.
+    async resetToTop(scroller, settle) {
+      if (!scroller) return;
+      try {
+        scroller.scrollTop = 0;
+      } catch (e) { /* detached node */ }
       scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-      scroller.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 550 }));
-      await Automator.sleep(350, 'Scroll');
-      if (Automator.stopped) return false;
+      await Automator.sleep(typeof settle === 'number' ? settle : 500, 'Mounting');
+    },
 
-      if (scroller.scrollTop === before) {
-        // Reached the bound: jiggle up then push down again.
-        scroller.scrollTop = Math.max(0, before - 120);
-        scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-        await Automator.sleep(220, 'Jiggle');
-        scroller.scrollTop = before + 550;
-        scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-        await Automator.sleep(600, 'Load');
-      }
+    /* ---- micro-scroll (virtualization compliant) ---- */
+    // The list is virtualized: rows are unmounted once scrolled out of view
+    // and only remounted by the framework. Jumping hundreds of pixels skips
+    // rows before React can evaluate them, so we advance in tiny 200px steps
+    // (roughly 3-4 rows) and let the list settle afterwards.
+    async microScroll(scroller, amount, settle) {
+      if (!scroller) return false;
+      const step = typeof amount === 'number' ? amount : 200;
+      const settleMs = typeof settle === 'number' ? settle : 350;
+      const before = scroller.scrollTop;
+      scroller.scrollTop = before + step;
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+      try {
+        scroller.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: step }));
+      } catch (e) { /* WheelEvent unavailable */ }
+      await Automator.sleep(settleMs, 'Scroll');
       return scroller.scrollTop !== before;
+    },
+
+    /* ---- bidirectional jiggle for loaders that stall at the bottom ---- */
+    async jiggleScroll(scroller) {
+      if (!scroller) return;
+      scroller.scrollTop = Math.max(0, scroller.scrollTop - 100);
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await Automator.sleep(200, 'Jiggle up');
+      scroller.scrollTop += 150;
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await Automator.sleep(200, 'Jiggle down');
     },
 
     /* ---- natural human-like click (pointer cascade + micro-jitter) ---- */
@@ -765,11 +953,12 @@
     },
 
     /* ---- limits ---- */
-    dailyCapReached() {
+    dailyCapReached(kind) {
       const s = Store.getStats();
-      if (s.count >= CONFIG.maxDailyActions) {
-        UI.setStatus('Daily cap reached (' + s.count + '/' + CONFIG.maxDailyActions + '). Stopping.');
-        UI.log('Daily cap reached. Stopping.');
+      const used = kind === 'unfollows' ? s.unfollows : s.follows;
+      if (used >= CONFIG.maxDailyActions) {
+        UI.setStatus('Daily cap reached (' + used + '/' + CONFIG.maxDailyActions + ' ' + kind + '). Stopping.');
+        UI.log('Daily cap reached for ' + kind + '. Stopping.');
         return true;
       }
       return false;
@@ -842,7 +1031,7 @@
       }
 
       Store.setFollow(username);
-      const count = Store.incrementStats();
+      const count = Store.incrementFollows();
       UI.updateToday();
       UI.log('FOLLOW #' + count + ' -> ' + username);
       return 1;
@@ -860,50 +1049,469 @@
       // Permanently blacklist and forget the follow record.
       Store.addBlacklist(username);
       Store.removeHistory(username);
-      const count = Store.incrementStats();
+      const count = Store.incrementUnfollows();
       UI.updateToday();
-      UI.log('UNFOLLOW #' + count + ' + blacklist -> ' + username);
+      const wasBlacklisted = Store.getBlacklist().has(username);
+      UI.log('UNFOLLOW #' + count + (wasBlacklisted ? ' (was blacklisted)' : ' (>24h aged)') + ' -> ' + username);
       return 1;
     },
 
+    detectFollowerTarget() {
+      Automator._lastHeaderRaw = '';
+      const dialog = Automator.findDialog();
+      if (!dialog) return 0;
+
+      // Determine which modal is open by reading its title.
+      // Instagram renders "Followers" or "Following" as the modal header.
+      let modalKind = null;
+      const headings = dialog.querySelectorAll('h1, h2, h3, [role="heading"]');
+      for (const h of headings) {
+        const t = (h.innerText || '').trim();
+        if (/^followers?\.?$/i.test(t)) { modalKind = 'followers'; break; }
+        if (/^following\.?$/i.test(t)) { modalKind = 'following'; break; }
+      }
+      if (!modalKind) {
+        // Fallback: first 80 chars of dialog text.
+        const head = (dialog.innerText || '').slice(0, 80);
+        if (/^followers?\b/i.test(head)) modalKind = 'followers';
+        else if (/^following\b/i.test(head)) modalKind = 'following';
+      }
+      if (!modalKind) return 0;
+
+      // Find the matching count on the profile page (outside the dialog).
+      const pattern = modalKind === 'followers'
+        ? /([\d.,]+)\s*(k|m)?\s*followers?/i
+        : /([\d.,]+)\s*(k|m)?\s*following/i;
+      const candidates = [];
+      const all = document.querySelectorAll('a, span, div, h1, h2, h3, p');
+      for (const el of all) {
+        if (el.closest && el.closest('div[role="dialog"]')) continue;
+        if (el.closest && el.closest('#sa-panel')) continue;
+        if (el.children.length > 2) continue;
+        const t = (el.innerText || '').trim();
+        if (!t || t.length > 60) continue;
+        const m = t.match(pattern);
+        if (!m) continue;
+        let n = parseInt(m[1].replace(/[^\d]/g, ''), 10);
+        const suf = (m[2] || '').toLowerCase();
+        if (suf === 'k') n *= 1000;
+        if (suf === 'm') n *= 1000000;
+        if (isNaN(n) || n <= 0 || n > 10000000) continue;
+        candidates.push({ text: t, n: n });
+      }
+
+      // Prefer the shortest candidate (most likely just "187 following").
+      candidates.sort((a, b) => a.text.length - b.text.length);
+      if (candidates[0]) {
+        Automator._lastHeaderRaw = modalKind + ' -> "' + candidates[0].text + '"';
+        return candidates[0].n;
+      }
+      return 0;
+    },
+
+    getCookie(name) {
+      const parts = ('; ' + document.cookie).split('; ' + name + '=');
+      if (parts.length !== 2) return null;
+      return parts.pop().split(';').shift();
+    },
+
+    apiUrl(kind, userId, maxId) {
+      const base = 'https://www.instagram.com/api/v1/friendships/' + userId + '/' + kind + '/?count=' + IG_API.count;
+      return maxId ? base + '&max_id=' + encodeURIComponent(maxId) : base;
+    },
+
+    async fetchFriendshipPage(kind, maxId) {
+      const userId = Automator.getCookie('ds_user_id');
+      const csrf = Automator.getCookie('csrftoken');
+      if (!userId) throw new Error('NO_USER_ID');
+      if (!csrf) throw new Error('NO_CSRF');
+      const headers = {
+        'X-IG-App-ID': IG_API.appId,
+        'X-ASBD-ID': IG_API.asbdId,
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-CSRFToken': csrf,
+        'Accept': '*/*'
+      };
+      const resp = await fetch(Automator.apiUrl(kind, userId, maxId), {
+        credentials: 'same-origin',
+        headers: headers
+      });
+      if (!resp.ok) {
+        throw new Error('HTTP_' + resp.status);
+      }
+      const json = await resp.json();
+      if (!json || (json.status && json.status === 'fail')) {
+        throw new Error('API_FAIL: ' + (json && json.message ? json.message : 'unknown'));
+      }
+      return json;
+    },
+
+    async fetchProfileCount(kind) {
+      const userId = Automator.getCookie('ds_user_id');
+      const csrf = Automator.getCookie('csrftoken');
+      if (!userId || !csrf) return 0;
+      try {
+        const resp = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent('i'), {
+          credentials: 'same-origin',
+          headers: {
+            'X-IG-App-ID': IG_API.appId,
+            'X-Requested-With': 'XMLHttpRequest',
+            'X-CSRFToken': csrf
+          }
+        });
+        if (!resp.ok) return 0;
+        const j = await resp.json();
+        const u = j && j.data && j.data.user;
+        if (!u) return 0;
+        return kind === 'following' ? (u.edge_follow ? u.edge_follow.count : 0) : (u.edge_followed_by ? u.edge_followed_by.count : 0);
+      } catch (e) {
+        return 0;
+      }
+    },
+
+    async scanViaApi(kind, expectedTarget) {
+      const kindLabel = kind;
+      const officialCount = await Automator.fetchProfileCount(kind);
+      if (officialCount > 0) {
+        UI.logDebug('Profile reports ' + officialCount + ' ' + kindLabel + '.');
+      }
+
+      async function doOnePass() {
+        const collected = new Set();
+        let maxId = null;
+        let pageCount = 0;
+        let lastProgressLog = 0;
+        while (pageCount < IG_API.maxPages && !Automator.stopped) {
+          let page;
+          try {
+            page = await Automator.fetchFriendshipPage(kind, maxId);
+          } catch (e) {
+            const msg = String(e && e.message || e);
+            if (msg === 'NO_USER_ID' || msg === 'NO_CSRF') {
+              UI.logDebug('API unavailable (' + msg + '). Falling back to DOM scan.');
+              return null;
+            }
+            UI.log('API error (' + msg + '). Falling back to DOM scan.');
+            return null;
+          }
+          const users = (page && page.users) || [];
+          for (const u of users) {
+            if (u && u.username) collected.add(String(u.username));
+          }
+          pageCount++;
+          UI.setStatus('API scan: ' + collected.size + ' ' + kindLabel + ' (page ' + pageCount + ')...');
+          if (collected.size - lastProgressLog >= 50) {
+            UI.log('Scanning via API: ' + collected.size + ' loaded...');
+            lastProgressLog = collected.size;
+          }
+          const nextId = page && page.next_max_id;
+          const hasMore = nextId !== null && nextId !== undefined && nextId !== '' && String(nextId) !== '0';
+          if (!hasMore) break;
+          maxId = page.next_max_id;
+          await Automator.sleep(700 + Math.floor(Math.random() * 400), 'API page');
+        }
+        if (Automator.stopped) return null;
+        return Array.from(collected);
+      }
+
+      UI.log('Scanning via Instagram API (' + kindLabel + ')...');
+
+      if (expectedTarget > 0) {
+        UI.logDebug('DOM target: ' + expectedTarget + ' ' + kindLabel + '.');
+      }
+
+      const union = new Set();
+      const maxRuns = 4;
+      let lastSize = -1;
+      let stableRuns = 0;
+      const targetForConvergence = expectedTarget && expectedTarget > 0 ? expectedTarget : (officialCount > 0 ? officialCount : 0);
+
+      for (let run = 1; run <= maxRuns && !Automator.stopped; run++) {
+        if (run > 1) {
+          UI.logDebug('Union pass ' + run + '/' + maxRuns + ' (have ' + union.size + ', target ' + (targetForConvergence || '?') + ')...');
+          await Automator.sleep(1200, 'Between passes');
+        }
+
+        const onePass = await doOnePass();
+        if (onePass === null) {
+          if (run === 1) return null;
+          break;
+        }
+
+        const before = union.size;
+        for (const u of onePass) union.add(u);
+        const gained = union.size - before;
+
+        // Convergence: two passes in a row with no growth AND we've hit the
+        // target OR we have no target to compare against.
+        if (gained === 0 && union.size === lastSize) {
+          stableRuns++;
+          UI.logDebug('Stable run ' + stableRuns + '/2 at ' + union.size + '.');
+          if (stableRuns >= 2) {
+            UI.logDebug('Converged. Stopping union.');
+            break;
+          }
+        } else {
+          stableRuns = 0;
+        }
+        lastSize = union.size;
+
+        if (targetForConvergence > 0 && union.size >= targetForConvergence) {
+          UI.logDebug('Reached target ' + targetForConvergence + '. Stopping union.');
+          break;
+        }
+      }
+
+      if (Automator.stopped) return null;
+      return Array.from(union);
+    },
+
     /* ---- scan my own followers (mutual protection list) ---- */
-    async scanMyFollowers() {
+    async scanCurrentList() {
       if (Automator.running) {
         UI.log('A loop is running. Press Stop before scanning.');
         return;
       }
+
+      // Detect which modal is open (followers vs following) and pick the
+      // matching storage target. Fall back to the page URL when no modal is
+      // present (the API path does not need the dialog at all).
       const dialog = Automator.findDialog();
+      let isFollowingModal = false;
+      let storeKey;
+      if (dialog) {
+        const dialogTitle = (dialog.innerText || '').slice(0, 60).toLowerCase();
+        isFollowingModal = /^following\b/.test(dialogTitle);
+        storeKey = isFollowingModal ? 'following' : 'followers';
+      } else if (location.pathname.indexOf('/followers') !== -1) {
+        storeKey = 'followers';
+      } else if (location.pathname.indexOf('/following') !== -1) {
+        storeKey = 'following';
+      } else {
+        UI.log('Open the Followers or Following modal first.');
+        return;
+      }
+
+      const expectedTargetCache = Automator.detectFollowerTarget();
+
+      UI.log('Scanning your ' + storeKey + ' list...');
+
+      // Preferred path: the internal friendships API (paginated, accurate).
+      const apiResult = await Automator.scanViaApi(storeKey, expectedTargetCache);
+      if (apiResult !== null) {
+        if (storeKey === 'following') {
+          Store.setMyFollowing(apiResult);
+        } else {
+          Store.setMyFollowers(apiResult);
+        }
+        Store.setLastSync(storeKey, Date.now());
+        const expected = expectedTargetCache || 0;
+        if (expected > 0) {
+          const diff = expected - apiResult.length;
+          if (diff > 0) {
+            UI.log('Final (' + storeKey + '): ' + apiResult.length + ' active (profile shows ' + expected + ', ' + diff + ' hidden/deleted by Instagram).');
+          } else {
+            UI.log('Final (' + storeKey + '): ' + apiResult.length + ' (via API, matches profile).');
+          }
+        } else {
+          UI.log('Final (' + storeKey + '): ' + apiResult.length + ' (via API).');
+        }
+        UI.setStatus('Scanned ' + apiResult.length + ' ' + storeKey + '.');
+        UI.updateToday();
+        UI.updateNetworkCounts();
+        UI.updateSyncStatus();
+        return;
+      }
+
+      // Fallback: DOM scraping for edge cases (missing cookies, API failure).
       if (!dialog) {
         UI.setStatus('Open your Followers modal first.');
-        UI.log('No modal found for scanning.');
+        UI.log('No modal found for DOM fallback scan.');
         return;
       }
       const scroller = Automator.findScrollContainer(dialog);
-      const found = Store.getMyFollowers();
-      try { scroller.scrollTop = 0; } catch (e) { /* noop */ }
-      UI.log('Scanning your followers list...');
-      let noNew = 0;
-      while (true) {
-        const before = found.size;
-        const anchors = scroller.querySelectorAll('a[href]');
-        for (const a of anchors) {
-          const href = a.getAttribute('href') || '';
-          const clean = href.replace(/^https?:\/\/[^\/]+/, '');
-          const m = clean.match(/^\/([A-Za-z0-9._]+)\/?$/);
-          if (m && m[1] && ['p', 'explore', 'reel', 'stories', 'accounts', 'direct', 'about', 'directory'].indexOf(m[1]) === -1) {
-            found.add(m[1]);
+      if (!scroller) {
+        UI.setStatus('No scroll container found.');
+        return;
+      }
+
+      const targetCount = Automator.detectFollowerTarget();
+      if (targetCount > 0) {
+        UI.logDebug('Target: ' + targetCount + ' (raw: "' + (Automator._lastHeaderRaw || '') + '")');
+      } else {
+        UI.log('No header target found. Using stall-based stopping.');
+      }
+
+      const collected = new Set();
+
+      const passes = [
+        { label: 'down-fast', step: 200, settle: 400, direction: 'down', resetTo: 'top' },
+        { label: 'down-slow', step: 80,  settle: 800, direction: 'down', resetTo: 'top' },
+        { label: 'up-slow',   step: 80,  settle: 800, direction: 'up',   resetTo: 'bottom' },
+        { label: 'down-final',step: 60,  settle: 900, direction: 'down', resetTo: 'top' }
+      ];
+
+      let prevPassSize = -1;
+
+      for (let pi = 0; pi < passes.length && !Automator.stopped; pi++) {
+        const cfg = passes[pi];
+
+        // Reset scroll position for this pass.
+        if (cfg.resetTo === 'bottom') {
+          await Automator.sleep(400, 'Reset');
+          scroller.scrollTop = scroller.scrollHeight;
+          scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+          await Automator.sleep(1200, 'Mounting bottom');
+        } else {
+          await Automator.resetToTop(scroller, pi === 0 ? 800 : 1200);
+        }
+
+        UI.logDebug('Pass ' + (pi + 1) + '/' + passes.length + ' (' + cfg.label + ') start, size=' + collected.size);
+
+        let stall = 0;
+        const maxStall = targetCount > 0 ? Math.max(25, Math.ceil(targetCount / 10)) : 30;
+        let lastHeight = scroller.scrollHeight;
+        let lastTop = scroller.scrollTop;
+
+        while (!Automator.stopped) {
+          const before = collected.size;
+          const anchors = dialog.querySelectorAll('a[href]');
+          for (const a of anchors) {
+            const u = usernameFromHref(a.getAttribute('href'));
+            if (u) collected.add(u);
+          }
+          const gained = collected.size - before;
+          const height = scroller.scrollHeight;
+          const top = scroller.scrollTop;
+          const heightGrew = height > lastHeight + 5;
+
+          const atTop = top <= 5;
+          const atBottom = top + scroller.clientHeight >= height - 15;
+          const atEdge = cfg.direction === 'up' ? atTop : atBottom;
+
+          UI.setStatus('Scanning ' + (pi + 1) + '/' + passes.length + ': ' + collected.size + (targetCount > 0 ? '/' + targetCount : '') + '...');
+
+          if (targetCount > 0 && collected.size >= targetCount) {
+            UI.log('Target reached.');
+            break;
+          }
+
+          if (gained === 0 && !heightGrew && atEdge) {
+            stall++;
+          } else {
+            stall = 0;
+          }
+          if (stall >= maxStall) {
+            UI.logDebug('Pass ' + (pi + 1) + ' stalled at ' + collected.size + '.');
+            break;
+          }
+
+          lastHeight = Math.max(lastHeight, height);
+          lastTop = top;
+
+          if (atEdge) {
+            await Automator.jiggleScroll(scroller);
+          } else if (cfg.direction === 'up') {
+            const step = cfg.step;
+            scroller.scrollTop = Math.max(0, top - step);
+            scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+            try { scroller.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -step })); } catch (e) {}
+            await Automator.sleep(cfg.settle, 'Scan up');
+          } else {
+            await Automator.microScroll(scroller, cfg.step, cfg.settle);
           }
         }
-        if (found.size === before) noNew++; else noNew = 0;
-        UI.log('Scanning... ' + found.size + ' followers found.');
-        if (noNew > 6) break;
-        await Automator.incrementalScroll(scroller);
-        await Automator.sleep(800, 'Scan');
+
+        if (targetCount > 0 && collected.size >= targetCount) break;
+        if (pi > 0 && collected.size === prevPassSize) {
+          UI.logDebug('Pass ' + (pi + 1) + ' added no new usernames.');
+        }
+        prevPassSize = collected.size;
       }
-      const list = Array.from(found);
-      Store.setMyFollowers(list);
-      UI.log('Saved ' + list.length + ' mutual followers.');
-      UI.setStatus('Scanned ' + list.length + ' mutual followers.');
+
+      const list = Array.from(collected);
+      if (isFollowingModal) {
+        Store.setMyFollowing(list);
+      } else {
+        Store.setMyFollowers(list);
+      }
+
+      if (targetCount > 0) {
+        const missing = targetCount - list.length;
+        if (missing > 0) {
+          UI.log('Final (' + storeKey + '): ' + list.length + '/' + targetCount + ' (' + missing + ' not rendered by platform).');
+          UI.setStatus('Scanned ' + list.length + '/' + targetCount + ' ' + storeKey + '.');
+        } else {
+          UI.log('Final (' + storeKey + '): ' + list.length + '/' + targetCount + ' (complete).');
+          UI.setStatus('Scanned ' + list.length + ' ' + storeKey + '.');
+        }
+      } else {
+        UI.log('Final (' + storeKey + '): ' + list.length + ' ' + storeKey + ' (no header target).');
+        UI.setStatus('Scanned ' + list.length + ' ' + storeKey + '.');
+      }
+
+      Store.setLastSync(storeKey, Date.now());
+    },
+
+    blacklistNonFollowers() {
+      const following = Store.getMyFollowing();
+      const followers = Store.getMyFollowers();
+      if (following.size === 0) {
+        UI.setStatus('Sync your Following list first.');
+        UI.log('Cannot blacklist: Following list is empty. Run [Sync Following] first.');
+        return 0;
+      }
+      if (followers.size === 0) {
+        UI.setStatus('Sync your Followers list first.');
+        UI.log('Cannot blacklist: Followers list is empty. Run [Sync Followers] first.');
+        return 0;
+      }
+      const blacklist = Store.getBlacklist();
+      const targets = [];
+      for (const u of following) {
+        if (followers.has(u)) continue;
+        if (blacklist.has(u)) continue;
+        targets.push(u);
+      }
+      if (targets.length === 0) {
+        UI.setStatus('Nothing to blacklist.');
+        UI.log('No new non-followers to blacklist.');
+        return 0;
+      }
+      const preview = targets.slice(0, 10).join(', ');
+      const more = targets.length > 10 ? ' ... (+' + (targets.length - 10) + ' more)' : '';
+      const ok = confirm(
+        'Blacklist ' + targets.length + ' accounts you follow but who do not follow back?\n\n' +
+        preview + more + '\n\n' +
+        'These accounts will never be auto-followed again.\n\nThey have been queued for the next [Start Unfollow >24h] run. Open your Following modal and press that button to actually unfollow them.'
+      );
+      if (!ok) {
+        UI.log('Blacklist cancelled by user.');
+        return 0;
+      }
+      const backdated = Date.now() - (CONFIG.unfollowCooldownHours + 1) * 3600 * 1000;
+      const history = Store.getHistory();
+      let historyAdded = 0;
+      for (const u of targets) {
+        blacklist.add(u);
+        if (!history[u]) {
+          history[u] = backdated;
+          historyAdded++;
+        } else if (Date.now() - history[u] <= CONFIG.unfollowCooldownHours * 3600 * 1000) {
+          // Already in history but too recent; backdate it so unfollow can act.
+          history[u] = backdated;
+          historyAdded++;
+        }
+      }
+      writeJSON(KEYS.blacklist, Array.from(blacklist));
+      writeJSON(KEYS.history, history);
+      UI.log('Blacklisted ' + targets.length + ' non-followers.');
+      if (historyAdded > 0) {
+        UI.log(historyAdded + ' queued for unfollow (next [Start Unfollow] run).');
+      }
+      UI.setStatus('Blacklisted ' + targets.length + ' accounts.');
+      UI.updateToday();
+      return targets.length;
     },
 
     /* ---- FOLLOW LOOP ---- */
@@ -922,6 +1530,15 @@
         return;
       }
       const scroller = Automator.findScrollContainer(dialog);
+
+      // Start cleanly at the very top and let the first batch mount.
+      await Automator.resetToTop(scroller, 500);
+
+      // Usernames already inspected during this run: stops the virtualized
+      // list from re-evaluating (or getting stuck on) remounted rows.
+      const processedThisRun = new Set();
+      const skippableLabels = SELECTORS.skippableButtonText.map(s => s.toLowerCase());
+
       let actionCount = 0;
       let followsThisSession = 0;
       let searchCycles = 0;
@@ -929,7 +1546,7 @@
 
       while (!Automator.stopped) {
         if (Automator.checkBlocked()) break;
-        if (Automator.dailyCapReached()) break;
+        if (Automator.dailyCapReached('follows')) break;
 
         searchCycles++;
         if (searchCycles % CONFIG.actionsBatchSize === 0) {
@@ -938,70 +1555,86 @@
           if (Automator.stopped) break;
         }
 
-        const buttons = Automator.getButtons(scroller, SELECTORS.followButtonText);
-        let actedThisRound = 0;
+        const myFollowers = Store.getMyFollowers();
+        const blacklist = Store.getBlacklist();
+        const history = Store.getHistory();
 
+        // ---- Step A: read all currently mounted buttons in the container ----
+        const buttons = Automator.getButtons(scroller, SELECTORS.followButtonText);
+        const targets = [];
         for (const btn of buttons) {
           if (Automator.stopped) break;
-          if (Automator.dailyCapReached()) break;
-          if (Automator.checkBlocked()) break;
 
           const label = (btn.textContent || '').trim().toLowerCase();
           const username = Automator.usernameFor(btn);
+          if (!username) continue;               // Row not hydrated yet: retry next pass.
 
-          // Someone who already follows us: protect them and blacklist.
-          if (label === 'follow back') {
-            if (username) {
-              UI.log('SKIP + blacklist (follows you): ' + username);
-              Store.addBlacklist(username);
-            }
-            continue;
-          }
-          if (SELECTORS.skippableButtonText.map(s => s.toLowerCase()).indexOf(label) !== -1) continue;
+          const key = username.toLowerCase();
+          if (processedThisRun.has(key)) continue;
 
-          if (!username) { UI.log('Could not extract username, skipping.'); continue; }
-
-          const myFollowers = Store.getMyFollowers();
-          if (myFollowers.has(username)) {
-            UI.log('SKIP + blacklist (already follows you): ' + username);
+          // Someone who already follows us: protect + blacklist, never revisit.
+          if (label === 'follow back' || myFollowers.has(username)) {
+            UI.log('SKIP + blacklist (follows you): ' + username);
             Store.addBlacklist(username);
+            processedThisRun.add(key);
+            continue;
+          }
+          if (skippableLabels.indexOf(label) !== -1) {
+            processedThisRun.add(key);
+            continue;
+          }
+          if (blacklist.has(username)) {
+            UI.log('SKIP blacklist: ' + username);
+            processedThisRun.add(key);
+            continue;
+          }
+          if (history[username]) {
+            UI.log('SKIP already followed: ' + username);
+            processedThisRun.add(key);
             continue;
           }
 
-          if (Store.getBlacklist().has(username)) { UI.log('SKIP blacklist: ' + username); continue; }
-          if (Store.getHistory()[username]) { UI.log('SKIP already followed: ' + username); continue; }
-
-          UI.setStatus('Follow: ' + username);
-          const did = await Automator.doFollow(btn, username);
-          if (Automator.stopped) break;
-          if (did) {
-            actedThisRound++;
-            actionCount++;
-            followsThisSession++;
-            if (Automator.sessionTargetReached(followsThisSession)) break;
-
-            const wait = Automator.randomDelay();
-            UI.setStatus('Waiting ' + Math.round(wait / 1000) + 's (jitter)...');
-            await Automator.sleep(wait, 'Delay');
-            if (Automator.stopped) break;
-            await Automator.batchPause(actionCount);
-          }
+          targets.push({ btn, username, key });
         }
 
-        if (actedThisRound === 0) {
-          noNewRounds++;
-          UI.setStatus('Scrolling to load more users...');
-          const moved = await Automator.incrementalScroll(scroller);
-          await Automator.sleep(CONFIG.searchCycleDelay, 'Reload');
-          await Automator.sleep(1500, 'Waiting for network');
-          if (!moved && noNewRounds > 15) {
-            UI.setStatus('End of list / no more users loading.');
-            UI.log('No new users found. Stopping.');
-            break;
+        // ---- Step B: process every eligible user in the current view ----
+        if (targets.length) {
+          for (const target of targets) {
+            if (Automator.stopped || Automator.dailyCapReached('follows')) break;
+            if (Automator.checkBlocked()) break;
+
+            processedThisRun.add(target.key);
+            UI.setStatus('Follow: ' + target.username);
+            const did = await Automator.doFollow(target.btn, target.username);
+            if (Automator.stopped) break;
+            if (did) {
+              actionCount++;
+              followsThisSession++;
+              if (Automator.sessionTargetReached(followsThisSession)) break;
+
+              const wait = Automator.randomDelay();
+              UI.setStatus('Waiting ' + Math.round(wait / 1000) + 's (jitter)...');
+              await Automator.sleep(wait, 'Delay');
+              if (Automator.stopped) break;
+              await Automator.batchPause(actionCount);
+            }
           }
-        } else {
           noNewRounds = 0;
           await Automator.sleep(CONFIG.searchCycleDelay, 'Cycle');
+          continue; // Re-scan the same view before scrolling.
+        }
+
+        // ---- Step C: nothing eligible here -> ONE micro-scroll of 200px ----
+        noNewRounds++;
+        UI.setStatus('Scrolling to load more users...');
+        const moved = await Automator.microScroll(scroller, 200, 350);
+        if (Automator.stopped) break;
+        await Automator.sleep(CONFIG.searchCycleDelay, 'Reload');
+        await Automator.sleep(1500, 'Waiting for network');
+        if (!moved && noNewRounds > 15) {
+          UI.setStatus('End of list / no more users loading.');
+          UI.log('No new users found. Stopping.');
+          break;
         }
       }
 
@@ -1016,7 +1649,16 @@
       Automator.running = true;
       Automator.stopped = false;
       UI.setWarning('');
-      UI.log('Start UNFOLLOW loop (>24h).');
+      UI.log('Start UNFOLLOW loop (non-followers + blacklisted).');
+
+      const myFollowersCheck = Store.getMyFollowers();
+      if (myFollowersCheck.size === 0) {
+        UI.setStatus('Sync your Followers list first.');
+        UI.log('Refusing to run: Followers list is empty. Mutual followers would not be protected.');
+        UI.log('Go to STEP 1 and press [Sync Followers] first.');
+        Automator.running = false;
+        return;
+      }
 
       const dialog = Automator.findDialog();
       if (!dialog) {
@@ -1027,8 +1669,14 @@
       }
       const scroller = Automator.findScrollContainer(dialog);
       const cooldownMs = CONFIG.unfollowCooldownHours * 3600 * 1000;
-      const history = Store.getHistory();
 
+      // Start cleanly at the very top and let the first batch mount.
+      await Automator.resetToTop(scroller, 500);
+
+      // Usernames already inspected during this run.
+      const processedThisRun = new Set();
+
+      const history = Store.getHistory();
       let eligible = 0;
       for (const u in history) {
         if (Date.now() - history[u] > cooldownMs) eligible++;
@@ -1041,7 +1689,7 @@
 
       while (!Automator.stopped) {
         if (Automator.checkBlocked()) break;
-        if (Automator.dailyCapReached()) break;
+        if (Automator.dailyCapReached('unfollows')) break;
 
         searchCycles++;
         if (searchCycles % CONFIG.actionsBatchSize === 0) {
@@ -1050,60 +1698,71 @@
           if (Automator.stopped) break;
         }
 
-        const buttons = Automator.getButtons(scroller, ['Following', 'Requested']);
-        let actedThisRound = 0;
+        const myFollowers = Store.getMyFollowers();
         const curHistory = Store.getHistory();
+        const curBlacklist = Store.getBlacklist();
 
+        // ---- Step A: read all currently mounted buttons in the container ----
+        const buttons = Automator.getButtons(scroller, ['Following', 'Requested']);
+        const targets = [];
         for (const btn of buttons) {
           if (Automator.stopped) break;
-          if (Automator.dailyCapReached()) break;
-          if (Automator.checkBlocked()) break;
 
           const username = Automator.usernameFor(btn);
-          if (!username) continue;
+          if (!username) continue;               // Row not hydrated yet: retry next pass.
 
-          // Never unfollow a mutual follower.
-          const myFollowers = Store.getMyFollowers();
+          const key = username.toLowerCase();
+          if (processedThisRun.has(key)) continue;
+
+          // Mutual followers are never touched.
           if (myFollowers.has(username)) {
             UI.log('PROTECTED (mutual follow): ' + username);
+            processedThisRun.add(key);
             continue;
           }
 
+          // Everyone else in the Following list is a non-follower.
+          const isBlacklisted = curBlacklist.has(username);
           const ts = curHistory[username];
-          if (ts && Date.now() - ts <= cooldownMs) {
-            UI.log('SKIP (under 24h): ' + username);
-            continue;
-          }
-          if (!ts) {
-            UI.log('SKIP (not in history): ' + username);
-            continue;
-          }
+          const source = isBlacklisted ? 'blacklist' : (ts ? 'aged' : 'non-follower');
 
-          UI.setStatus('Unfollow: ' + username);
-          await Automator.doUnfollow(btn, username);
-          actedThisRound++;
-          actionCount++;
-
-          const wait = Automator.randomDelay();
-          UI.setStatus('Waiting ' + Math.round(wait / 1000) + 's (jitter)...');
-          await Automator.sleep(wait, 'Delay');
-          if (Automator.stopped) break;
-          await Automator.batchPause(actionCount);
+          targets.push({ btn, username, key, reason: source });
         }
 
-        if (actedThisRound === 0) {
-          noNewRounds++;
-          UI.setStatus('Scrolling to load more users...');
-          const moved = await Automator.incrementalScroll(scroller);
-          await Automator.sleep(CONFIG.searchCycleDelay, 'Reload');
-          if (!moved && noNewRounds > 12) {
-            UI.setStatus('End of list. Unfollow loop finished.');
-            UI.log('No more accounts to unfollow. Stopping.');
-            break;
+        // ---- Step B: process every eligible user in the current view ----
+        if (targets.length) {
+          for (const target of targets) {
+            if (Automator.stopped || Automator.dailyCapReached('unfollows')) break;
+            if (Automator.checkBlocked()) break;
+
+            processedThisRun.add(target.key);
+            UI.setStatus('Unfollow (' + target.reason + '): ' + target.username + ' - Stop to abort');
+            const did = await Automator.doUnfollow(target.btn, target.username);
+            if (Automator.stopped) break;
+            if (did) {
+              actionCount++;
+              const wait = Automator.randomDelay();
+              UI.setStatus('Waiting ' + Math.round(wait / 1000) + 's (jitter)...');
+              await Automator.sleep(wait, 'Delay');
+              if (Automator.stopped) break;
+              await Automator.batchPause(actionCount);
+            }
           }
-        } else {
           noNewRounds = 0;
           await Automator.sleep(CONFIG.searchCycleDelay, 'Cycle');
+          continue; // Re-scan the same view before scrolling.
+        }
+
+        // ---- Step C: nothing eligible here -> ONE micro-scroll of 200px ----
+        noNewRounds++;
+        UI.setStatus('Scrolling to load more users...');
+        const moved = await Automator.microScroll(scroller, 200, 350);
+        if (Automator.stopped) break;
+        await Automator.sleep(CONFIG.searchCycleDelay, 'Reload');
+        if (!moved && noNewRounds > 12) {
+          UI.setStatus('End of list. Unfollow loop finished.');
+          UI.log('No more accounts to unfollow. Stopping.');
+          break;
         }
       }
 
@@ -1154,12 +1813,20 @@
     UI.loadSettings();
     Store.getStats(); // Resets stats on a new day.
     UI.updateToday();
-    UI.setStatus('Ready. Open a list and press Start.');
-    UI.log(TITLE + ' loaded. Today: ' + Store.getStats().count + '.');
+    UI.setStatus('Ready. Step 1: sync your lists.');
+    const s0 = Store.getStats();
+    UI.log(TITLE + ' loaded. Today: ' + s0.follows + ' follows, ' + s0.unfollows + ' unfollows.');
 
     UI.buttons.follow.addEventListener('click', () => Automator.startFollowLoop());
     UI.buttons.unfollow.addEventListener('click', () => Automator.startUnfollowLoop());
-    UI.buttons.scan.addEventListener('click', () => Automator.scanMyFollowers());
+    UI.buttons.syncFollowers.addEventListener('click', () => Automator.scanCurrentList());
+    UI.buttons.syncFollowing.addEventListener('click', () => Automator.scanCurrentList());
+    UI.buttons.advancedToggle.addEventListener('click', () => {
+      const box = UI.advancedBox;
+      const open = box.style.display === 'block';
+      box.style.display = open ? 'none' : 'block';
+      UI.buttons.advancedToggle.textContent = open ? '[\u25be Advanced]' : '[\u25b4 Advanced]';
+    });
     UI.buttons.stop.addEventListener('click', () => {
       Automator.stop();
       UI.setStatus('Stopped by user.');
