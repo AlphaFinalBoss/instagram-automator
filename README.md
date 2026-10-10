@@ -1,274 +1,190 @@
 # Instagram Automator
 
-> A self-contained, vanilla-JS automation tool for cleaning up your Instagram following list. Sync your followers and following via Instagram's own API, then unfollow everyone who doesn't follow you back — with automatic blacklist and built-in rate-limit protection.
+A small browser script that helps you clean up your Instagram following list. It syncs your followers and following through Instagram's own API, shows you who doesn't follow you back, and unfollows them one by one with human-like delays. Everyone it unfollows gets blacklisted so you never follow them again by accident.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![No dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)]()
-[![Single file](https://img.shields.io/badge/size-single%20file-blue.svg)]()
-
----
+No install. No build. One file. Paste it in your browser, click three buttons.
 
 ## What it does
 
-Instagram Automator is a single JavaScript file that runs directly in your browser on instagram.com. It adds a floating control panel with three buttons and handles the entire cleanup workflow for you:
+Instagram doesn't have a "who doesn't follow me back" view. This tool does.
 
-1. **Sync** — reads your complete Followers and Following lists directly from Instagram's internal API (deterministic, no DOM scraping, no lazy-load issues).
-2. **Compare** — knows exactly who follows you and who doesn't.
-3. **Act** — unfollows every non-follower with human-like delays, and adds each one to a persistent blacklist so the tool never follows them again.
+You open Instagram, paste the script in the browser console, and get a floating panel in the top-right corner. From there:
 
-You stay in control the whole time: nothing runs without your click, everything is logged, and there's a Stop button always visible.
+1. Click **Sync Followers** to pull your complete follower list.
+2. Click **Sync Following** to pull everyone you follow.
+3. Click **Unfollow Non-Followers** to remove the people who don't follow you back.
 
----
+Everything else happens automatically. Every unfollow is spaced out with random delays, mutual followers are never touched, and each account goes into a blacklist so it can't sneak back into your following later.
+
+## Why this approach
+
+Most Instagram cleanup tools scrape the DOM, which is fragile. Instagram's follower lists are rendered by React with virtualization: only 10-15 rows exist in the HTML at any given moment. You have to scroll in tiny increments, wait for React to mount new rows, and hope you didn't skip any.
+
+I spent weeks fighting this. Same list would return 179 one run, 186 the next, 189 the third. The count was never stable.
+
+Then I switched to Instagram's internal API:
+
+```
+
+GET /api/v1/friendships/{user_id}/{followers|following}/?count=200&max_id=...
+
+```
+
+One request returns 200 users. Pagination is a simple cursor. No scrolling, no timing, no guessing. 189 means 189 every single time, in about 3 seconds.
+
+The tool falls back to the DOM scraping path if the API is unavailable (missing cookies, blocked by extensions), but the API path is what you want.
 
 ## Features
 
-- **Deterministic API scanning** — uses Instagram's `/friendships/` endpoint, not DOM scraping. If you have 189 following, it reports 189 every time. No more counting 179 or 186 randomly.
-- **Three-step UI** — Sync → Automate. Nothing to configure if you just want to clean up.
-- **Human-like clicks** — every follow/unfollow simulates a full pointer cascade (pointerover → mousedown → mouseup → click) with micro-jitter on coordinates, so the actions look organic.
-- **Rate-limit protection** —
-  - Configurable batch size and batch delay (Safe Mode: 6 actions then 5 min pause).
-  - Separate daily caps for follows and unfollows.
-  - Session target (stop after N follows).
-  - Silent-rollback detection: if Instagram secretly reverts a follow without showing an error, the tool stops immediately and plays an alert.
-- **Auto-blacklist** — every unfollowed account goes to a persistent blacklist. The blacklist survives page reloads and browser restarts.
-- **Mutual follower protection** — anyone who follows you back is never touched. Ever.
-- **Persistent state** — followers, following, blacklist, daily stats, and follow history are all saved in `localStorage`.
-- **Optional verbose logging** — hidden under the Advanced drawer for debugging. Off by default so the log stays clean.
+**Deterministic scanning.** API-based, so results are consistent. No more "why does it say 186 this time".
 
----
+**Three steps, no config.** Sync, then unfollow. Sensible defaults are already safe. You don't need to touch the settings unless you want to.
 
-## Installation
+**Human-like clicks.** Each follow and unfollow fires a full pointer cascade (pointerover, mousedown, mouseup, click) with a few pixels of random jitter on the coordinates. It's still a synthetic click, but it doesn't look like a bot hammering a button.
 
-There are two ways to run it. Pick whichever fits your workflow.
+**Rate-limit protection built in.** Configurable batch size, batch delay, daily cap for follows and unfollows tracked separately, and a session target. Safe Mode runs 6 actions then pauses 5 minutes, stops after 20 follows total. That matches Instagram's real cooldown window.
 
-### Method A: Console paste (quickest, no setup)
+**Silent rollback detection.** Instagram sometimes accepts a follow click and quietly reverts it 2 seconds later without showing you an error. The tool waits, re-reads the button, and if it has flipped back to "Follow", stops the whole run and plays an alert. That's your signal to close the tab and try tomorrow.
 
-1. Open [instagram.com](https://www.instagram.com) and log in.
-2. Open the browser console:
-   - **macOS**: `Cmd + Option + J` (Chrome, Brave, Edge) or `Cmd + Option + C` (Safari with developer tools enabled).
-   - **Windows / Linux**: `F12` → Console tab.
-3. Open [`script.js`](./script.js) on this repo.
-4. Click the **Raw** button (top-right of the file view), then **Ctrl+A** to select all, **Ctrl+C** to copy.
-   - Alternatively, hover the code block on the non-Raw view and click the small copy icon in the top-right corner.
-5. Paste into the browser console and press Enter.
+**Auto-blacklist.** Every unfollowed account is saved to `localStorage`. The follow loop checks the blacklist before every action, so once someone is out, they stay out.
 
-A dark control panel appears in the top-right corner of the page. Done.
+**Mutual follower protection.** Anyone who follows you back is skipped with `PROTECTED (mutual follow)` in the log. The tool refuses to run the unfollow loop if you haven't synced your followers first, because without that list it can't tell who's mutual.
 
-> The script only runs in the current tab. If you reload the page, you need to paste again.
+**Everything is local.** State lives in your browser's `localStorage`. Nothing is sent anywhere except to instagram.com through the requests the tool itself makes.
 
-### Method B: Tampermonkey userscript (persistent)
+## Install
 
-If you plan to use it repeatedly, install it as a userscript so it loads automatically.
+Pick one.
+
+### Method A: Paste in console
+
+Fastest. Nothing to install, but you have to re-paste every time you reload Instagram.
+
+1. Open instagram.com and log in.
+2. Open the browser console. On Mac: Cmd+Option+J in Chrome, Brave or Edge. On Windows and Linux: F12 then Console tab.
+3. Open [script.js](script.js) on this repo, click the Raw button, select all (Ctrl+A or Cmd+A), copy.
+4. Paste in the console and hit Enter.
+
+A dark panel shows up in the top-right corner of the page.
+
+### Method B: Tampermonkey userscript
+
+Better if you use it regularly. It loads automatically on every Instagram visit.
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser.
-2. In Tampermonkey, create a new script.
-3. Paste the contents of `script.js` into the editor — but wrap it as a userscript:
+2. Create a new userscript in Tampermonkey.
+3. Paste the entire contents of `script.js` wrapped like this:
 
-   ```javascript
-   // ==UserScript==
-   // @name         Instagram Automator
-   // @namespace    https://github.com/AlphaFinalBoss/instagram-automator
-   // @version      2.2
-   // @description  Sync followers/following via IG API, unfollow non-followers with auto-blacklist.
-   // @match        https://www.instagram.com/*
-   // @grant        none
-   // @run-at       document-idle
-   // ==/UserScript==
+```javascript
+// ==UserScript==
+// @name         Instagram Automator
+// @namespace    https://github.com/AlphaFinalBoss/instagram-automator
+// @version      2.2
+// @description  Sync followers/following via IG API, unfollow non-followers with auto-blacklist.
+// @match        https://www.instagram.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
 
-   // ... paste the entire script.js contents here ...
+// paste the whole script.js here
 ```
 
-4. Save. The panel will now appear automatically every time you open Instagram.
+4. Save. From now on the panel appears by itself whenever you open Instagram.
 
----
+## How to use it
 
-## Quick Start
+Three buttons, in order.
 
-The workflow is three clicks. That's it.
+**Sync Followers.** Click it. Takes a few seconds. The status line updates to show your follower count. If you don't do this first, the unfollow loop will refuse to run.
 
-### 1. Sync your Followers list
+**Sync Following.** Click it. Same thing, for the people you follow.
 
-Click **`[Sync Followers]`**. The tool calls Instagram's API and stores your complete Followers list (anyone who follows you). Takes 3–10 seconds depending on size.
+**Unfollow Non-Followers.** Click it. A confirmation dialog shows how many accounts will be removed and previews the first ten names. Confirm, then the tool opens the Following modal and works through the list. Each unfollow takes 3-6 seconds, with a 5-minute pause after every 6 actions in Safe Mode.
 
-### 2. Sync your Following list
+Press **Stop / Pause** any time. Whatever's already done stays done.
 
-Click **`[Sync Following]`**. Same thing, but for the people you follow. Also 3–10 seconds.
+## Safe Mode and Fast Mode
 
-The status line at the top now shows: `Following: 189  ·  Followers: 312`.
+Two presets in the Advanced drawer.
 
-### 3. Unfollow non-followers
-
-- Click **`[Unfollow Non-Followers]`**.
-- A confirmation dialog shows how many accounts will be unfollowed.
-- Confirm. The tool opens your Following modal and unfollows each non-follower one by one with human-like delays.
-- Each unfollowed account is automatically added to the blacklist.
-
-The log shows progress: `UNFOLLOW #12 (non-follower) -> someusername`.
-
-You can press **`[Stop / Pause]`** at any time to abort mid-run. Anything already done stays done.
-
----
-
-## Safe Mode vs Fast Mode
-
-The Settings drawer (under `[▾ Advanced]`) has two presets.
-
-| Setting ↕▾ | Safe Mode (default) ↕▾ | Fast Mode ↕▾ |
+| Setting | Safe Mode | Fast Mode |
 |---|---|---|
-| −Session Target | 20 | unlimited |
-| −Daily Cap | 100 | 150 |
-| −Batch Size | 6 | 10 |
-| −Batch Delay | 300 s (5 min) | 90 s (1.5 min) |
+| Session Target | 20 | unlimited |
+| Daily Cap | 100 | 150 |
+| Batch Size | 6 | 10 |
+| Batch Delay | 300s | 90s |
+
+Safe Mode is what I actually use. 20 follows per session, then stop. Instagram's soft limits kick in somewhere around 25-30 follows in a short window, and staying under that keeps the account clean. The 5-minute batch delay mirrors the platform's cooldown.
+
+Fast Mode exists for people who want it, but it's genuinely aggressive. If you hit a soft block with Fast Mode, that's on the preset, not on the tool.
+
+You can edit any value directly. The preset switches to "Custom" the moment you change something.
+
+## Settings
+
+Under the Advanced drawer:
+
+- **Preset:** Safe, Fast, or Custom.
+- **Session Target:** how many follows before the loop stops. 0 means unlimited.
+- **Daily Cap:** maximum follows per day, and maximum unfollows per day. Counted separately.
+- **Batch Size:** how many actions before a long pause.
+- **Batch Delay:** how long that pause is, in seconds.
+- **Show debug logs:** verbose output. Adds API pagination details, stall events and target parsing to the log. Off by default.
+- **Manual blacklist input:** type a username and it goes straight into the blacklist.
+- **Export / Clear Blacklist:** downloads the blacklist as JSON, and optionally wipes it.
+
+## Data it stores
+
+Everything lives in `localStorage`, keys prefixed with `sa_`:
+
+| Key ↕▾ | Contents ↕▾ |
+|---|---|
+| −`sa_blacklist` | Usernames you've unfollowed or manually blacklisted |
+| −`sa_follow_history` | `{ username: timestamp }` for accounts you followed with this tool |
+| `sa_my_followers` | Who follows you, from the last sync |
+| `sa_my_following` | Who you follow, from the last sync |
+| `sa_daily_stats` | `{ date, follows, unfollows }`, resets daily |
+| `sa_settings` | Your preset and custom values |
+| `sa_last_sync` | Timestamps of the last sync for each list |
 ⚙
 
-**Safe Mode** is calibrated from real-world use: 20 follows per session, then stop. This avoids the silent rate-limits Instagram applies around the 20–30 follow mark. Batch delay of 5 minutes matches the platform's typical cooldown window.
-
-**Fast Mode** is aggressive — it will work for some accounts, but carries a higher risk of hitting a soft block. Not recommended for accounts you care about.
-
-You can customize any value in the Settings drawer. Any change auto-switches the preset to "Custom".
-
----
-
-## How it works
-
-### Why the API and not the page?
-
-Instagram renders its Followers and Following lists with a virtualized React list — only ~10 rows exist in the DOM at any time. Scraping them requires scrolling in precise increments and guessing when React has finished mounting new rows. This is non-deterministic: you get 179, 184, 186, 187, etc. on the same list.
-
-This tool instead uses Instagram's internal friendships endpoint:
-
-```
-GET https://www.instagram.com/api/v1/friendships/{user_id}/{followers|following}/?count=200&max_id=...
-```
-
-It returns paginated JSON with 200 users per request (server-side pagination via `next_max_id`). No rendering, no timing, no variance. The tool also handles the eventual-consistency quirk where early pages arrive short by running up to 3 union passes; typical convergence is 1–2 passes.
-
-### Auto-blacklist
-
-Every successfully unfollowed account is written to a `sa_blacklist` array in `localStorage`. The follow loop reads this array before every action and skips anyone on it. Net effect: once you unfollow someone, you never accidentally follow them again.
-
-### Mutual follower protection
-
-The Followers list is the source of truth for mutual protection. Before unfollowing anyone, the tool checks `sa_my_followers`. If the target is in that list, they're skipped with `PROTECTED (mutual follow)`.
-
-If your Followers list is empty when you click `[Unfollow Non-Followers]`, the tool refuses to run — otherwise it would unfollow everyone, including mutuals.
-
-### Silent rollback detection
-
-Instagram sometimes accepts a follow click and quietly reverts it 1–2 seconds later without showing any error (this is the "shadow rate-limit"). The tool waits 1.8 s after each follow, re-reads the button state, and if it has reverted to "Follow", it stops the entire run, plays a double alert tone, and shows a red warning banner. This is your signal to stop for the day.
-
----
-
-## Safety and warnings
-
-**Read this before using.**
-
-- **This automates actions on your personal Instagram account.** Any third-party tool that does this carries a risk of account restrictions. You are doing this at your own risk.
-- **Never set the daily cap above 150.** Instagram's actual follow limit for new accounts is often below 200, and behavioral flags don't appear immediately. Safe Mode's 100 is genuinely safe; 150 is a ceiling, not a target.
-- **The 24-hour cooldown that older versions had is gone.** The current Unfollow Non-Followers action will unfollow non-followers regardless of how recently you followed them. If you want to give someone 24h to follow you back, don't run the unfollow loop that day.
-- **Only run it on your own account.** It uses your session cookies (`ds_user_id`, `csrftoken`) and performs actions as you.
-- **Cookies stay local.** Nothing is sent anywhere except to instagram.com via the fetch calls that the tool makes. There is no backend, no telemetry, no analytics.
-- **No warranty.** MIT license — see [LICENSE](https://./LICENSE). If Instagram changes their API and the tool stops working, that's on the platform, not on the tool.
-
----
-
-## Settings reference
-
-Open the Advanced drawer to access:
-
-- **Preset** — Safe / Fast / Custom.
-- **Session Target** — stop the follow loop after N follows in one run. 0 means unlimited.
-- **Daily Cap** — maximum follows *and* maximum unfollows per day, tracked separately.
-- **Batch Size** — how many actions before a long pause.
-- **Batch Delay** — length of the pause, in seconds.
-- **Show debug logs** — verbose output for troubleshooting. Adds API pagination details, stall detection, and target parsing to the log.
-- **Manual blacklist input** — add a username directly without running a sync.
-- **Export / Clear Blacklist** — downloads the blacklist as JSON and optionally wipes it.
-
----
+To wipe everything, open the console and run `localStorage.clear()`. Note this also clears any other site data on instagram.com.
 
 ## Troubleshooting
 
-### "Sync failed: NO_CSRF" or "API unavailable"
+**"Sync failed: NO_CSRF"** or **"API unavailable".** Instagram's session cookies weren't readable. Usually this means you're not logged in, or an extension is stripping cookies. Brave Shields is fine as-is (the cookies we need are first-party). Try a private window with extensions off to narrow it down. If the API is truly unreachable, the tool falls back to the DOM path automatically.
 
-Instagram's session cookies weren't readable. Usually caused by:
+**"Refusing to run: Followers list is empty".** You clicked Unfollow before syncing Followers. This is a safety guard. Without the follower list, the tool has no way to know who's a mutual. Sync Followers first.
 
-- You're not logged in to Instagram. Log in first.
-- A browser extension is stripping cookies. Try in a private window with extensions disabled.
-- Brave Shields: `Block third-party cookies` doesn't affect us (the cookies we need are first-party), but aggressive script blockers might. Try `Allow all cookies` for instagram.com and reload.
+**"RATE LIMIT DETECTED (Silent Rollback)".** Instagram is quietly reverting your follows. Stop for the day. Next time, try a lower Session Target, maybe 10 instead of 20.
 
-If the API is truly unreachable, the tool falls back to the older DOM-scraping path automatically. It's slower and less accurate, but functional.
+**The panel disappeared after reload.** Console paste doesn't persist. Re-paste, or switch to Tampermonkey.
 
-### "Refusing to run: Followers list is empty"
+**"No modal found".** Open the Followers or Following modal in Instagram first, then click the button.
 
-You clicked `[Unfollow Non-Followers]` without a Followers sync. This is a safety guard — without the Followers list, the tool has no way to protect mutuals. Click `[Sync Followers]` first.
-
-### "RATE LIMIT DETECTED (Silent Rollback)"
-
-Instagram is silently reverting your follows. Stop for the day. Come back tomorrow, and consider running a lower session target (10 instead of 20) going forward.
-
-### The panel disappeared after reload
-
-Method A (console paste) doesn't persist across page loads. Re-paste the script, or switch to Method B (Tampermonkey).
-
-### "No modal found"
-
-The tool needs to see Instagram's Followers or Following modal to know what to scan. Open the modal first, then click the button.
-
----
-
-## Project structure
+## Project layout
 
 ```
 instagram-automator/
-├── script.js       # The entire tool (single file, no build step)
-├── README.md       # This file
-├── LICENSE         # MIT license
-└── .gitignore
+  script.js       the whole tool
+  README.md
+  LICENSE
+  .gitignore
 ```
 
-No `package.json`, no dependencies, no build. The file is loaded as-is.
-
----
-
-## Data storage
-
-Everything is in `localStorage` under keys prefixed with `sa_`:
-
-| Key ↕▾ | What it stores ↕▾ |
-|---|---|
-| −`sa_blacklist` | Array of usernames you've unfollowed or manually blacklisted. |
-| −`sa_follow_history` | Object of `{ username: timestamp }` for accounts you've followed with this tool. |
-| `sa_my_followers` | Array of usernames who follow you (from the last sync). |
-| `sa_my_following` | Array of usernames you follow (from the last sync). |
-| `sa_daily_stats` | `{ date, follows, unfollows }` — reset daily. |
-| `sa_settings` | Your preset and custom settings. |
-| `sa_last_sync` | Timestamps of the last followers/following sync. |
-⚙
-
-To wipe everything: open the browser console and run `localStorage.clear()`. Warning: this also clears any other site data on instagram.com.
-
----
+No `package.json`, no build step, no dependencies.
 
 ## Contributing
 
-Issues and pull requests welcome. The code is a single file with no build system, so changes are easy to test — just paste the modified `script.js` into your console and reload Instagram.
+Issues and PRs welcome. It's one file with no build system, so testing changes is easy: paste the modified script into your console and reload Instagram.
 
-Before submitting a PR:
-
-- Run `node --check script.js` to verify syntax.
-- Keep the vanilla-JS, no-dependency philosophy.
-- Keep all user-facing strings and log messages in English.
-
----
+Two requests before you open a PR: run `node --check script.js` to verify syntax, and keep all user-facing strings in English.
 
 ## License
 
-[MIT](https://./LICENSE). Do whatever you want, no warranty, no attribution required.
-
----
+MIT. Do what you want, no warranty.
 
 ## Disclaimer
 
-This project is not affiliated with Instagram or Meta. It's a browser-side automation tool that uses publicly-reachable endpoints on the site you're already logged in to. You assume all responsibility for how you use it.
+Not affiliated with Instagram or Meta. It's a browser-side script that talks to endpoints on the site you're already logged in to. You're responsible for how you use it.
 
