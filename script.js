@@ -1,5 +1,5 @@
 /* =========================================================================
- * Instagram Automator v2.2
+ * Instagram Automator v2.3
  * -------------------------------------------------------------------------
  * A self-contained, vanilla-JS console / userscript automator for
  * Instagram follow / unfollow workflows.
@@ -18,9 +18,10 @@
  *   - Shadow rate-limit / silent-rollback detection with audio alert.
  *   - Unfollow loop that targets every non-follower (auto-blacklists each
  *     one) and always protects mutual followers.
- *   - Persistent blacklist, follow/following history, per-day statistics
- *     (follows and unfollows tracked separately; daily cap applies to
- *     each independently).
+ *   - Persistent blacklist, follow/following history, per-day statistics.
+ *     Follows, pending requests (private accounts), and unfollows are
+ *     tracked separately. Pending requests are auto-reconciled on the
+ *     next Following sync.
  *   - Configurable session target, daily cap, batch size and batch delay.
  *   - Safe Mode / Fast Mode presets.
  *   - 3-step guided UI (Sync, Blacklist, Automate) with optional verbose
@@ -36,7 +37,7 @@
   /* ------------------------------------------------------------------ */
   if (window.SA_Automator) return; // Prevent double injection.
 
-  const VERSION = '2.2';
+  const VERSION = '2.3';
   const TITLE = 'Instagram Automator v' + VERSION;
 
   /* ------------------------------------------------------------------ */
@@ -127,6 +128,7 @@
   const KEYS = {
     blacklist: 'sa_blacklist',
     history: 'sa_follow_history',
+    pending: 'sa_pending_requests',
     stats: 'sa_daily_stats',
     myFollowers: 'sa_my_followers',
     following: 'sa_my_following',
@@ -223,20 +225,41 @@
       writeJSON(KEYS.history, h);
     },
 
+    getPendingRequests() {
+      const obj = readJSON(KEYS.pending, {});
+      return obj && typeof obj === 'object' ? obj : {};
+    },
+    setPendingRequest(username) {
+      if (!username) return;
+      const p = Store.getPendingRequests();
+      p[username] = Date.now();
+      writeJSON(KEYS.pending, p);
+    },
+    removePendingRequest(username) {
+      const p = Store.getPendingRequests();
+      if (p[username]) {
+        delete p[username];
+        writeJSON(KEYS.pending, p);
+      }
+    },
+    clearPendingRequests() {
+      writeJSON(KEYS.pending, {});
+    },
+
     /* ---- daily statistics ---- */
     getStats() {
       let stats = readJSON(KEYS.stats, null);
       const today = todayStr();
       if (!stats || stats.date !== today) {
-        stats = { date: today, follows: 0, unfollows: 0 };
+        stats = { date: today, follows: 0, pending: 0, unfollows: 0 };
         writeJSON(KEYS.stats, stats);
         return stats;
       }
-      // Migrate legacy { count } schema once.
-      if (typeof stats.follows !== 'number' || typeof stats.unfollows !== 'number') {
+      if (typeof stats.follows !== 'number' || typeof stats.unfollows !== 'number' || typeof stats.pending !== 'number') {
         const legacyCount = typeof stats.count === 'number' ? stats.count : 0;
-        stats.follows = 0;
-        stats.unfollows = legacyCount;
+        stats.follows = typeof stats.follows === 'number' ? stats.follows : 0;
+        stats.pending = typeof stats.pending === 'number' ? stats.pending : 0;
+        stats.unfollows = typeof stats.unfollows === 'number' ? stats.unfollows : legacyCount;
         delete stats.count;
         writeJSON(KEYS.stats, stats);
       }
@@ -247,6 +270,12 @@
       stats.follows += 1;
       writeJSON(KEYS.stats, stats);
       return stats.follows;
+    },
+    incrementPending() {
+      const stats = Store.getStats();
+      stats.pending += 1;
+      writeJSON(KEYS.stats, stats);
+      return stats.pending;
     },
     incrementUnfollows() {
       const stats = Store.getStats();
@@ -657,7 +686,7 @@
     function updateToday() {
       const s = Store.getStats();
       if (todayLine) {
-        todayLine.textContent = 'Today: ' + s.follows + '/' + CONFIG.maxDailyActions + ' follows  \u00b7  ' + s.unfollows + ' unfollows';
+        todayLine.textContent = 'Today: ' + s.follows + '/' + CONFIG.maxDailyActions + ' follows  \u00b7  ' + s.pending + ' pending  \u00b7  ' + s.unfollows + ' unfollows';
       }
       updateNetworkCounts();
       updateSyncStatus();
@@ -1017,10 +1046,11 @@
       if (blacklist.has(username)) { UI.log('SKIP (blacklist): ' + username); return 0; }
       const history = Store.getHistory();
       if (history[username]) { UI.log('SKIP (already followed): ' + username); return 0; }
+      const pending = Store.getPendingRequests();
+      if (pending[username]) { UI.log('SKIP (already requested): ' + username); return 0; }
 
       Automator.simulateHumanClick(button);
 
-      // Wait, then verify the button actually transitioned.
       await Automator.sleep(CONFIG.followVerifyDelay, 'Verifying');
       if (Automator.stopped) return 0;
 
@@ -1030,6 +1060,15 @@
         return 0;
       }
 
+      if (state.text === 'requested') {
+        Store.setPendingRequest(username);
+        const count = Store.incrementPending();
+        UI.updateToday();
+        UI.log('REQUEST #' + count + ' (pending) -> ' + username);
+        return 1;
+      }
+
+      // state.text === 'following'
       Store.setFollow(username);
       const count = Store.incrementFollows();
       UI.updateToday();
@@ -1303,6 +1342,27 @@
           Store.setMyFollowing(apiResult);
         } else {
           Store.setMyFollowers(apiResult);
+        }
+        if (storeKey === 'following') {
+          const pending = Store.getPendingRequests();
+          const followingSet = new Set(apiResult.map(u => u.toLowerCase()));
+          let confirmed = 0;
+          for (const username in pending) {
+            if (followingSet.has(username.toLowerCase())) {
+              // Request was accepted: promote to confirmed follow.
+              Store.setFollow(username);
+              delete pending[username];
+              confirmed++;
+            }
+          }
+          if (confirmed > 0) {
+            writeJSON(KEYS.pending, pending);
+            UI.log(confirmed + ' pending request' + (confirmed === 1 ? '' : 's') + ' now confirmed (promoted to follow history).');
+          }
+          const stillPending = Object.keys(pending).length;
+          if (stillPending > 0) {
+            UI.logDebug(stillPending + ' request' + (stillPending === 1 ? '' : 's') + ' still pending.');
+          }
         }
         Store.setLastSync(storeKey, Date.now());
         const expected = expectedTargetCache || 0;
@@ -1815,7 +1875,7 @@
     UI.updateToday();
     UI.setStatus('Ready. Step 1: sync your lists.');
     const s0 = Store.getStats();
-    UI.log(TITLE + ' loaded. Today: ' + s0.follows + ' follows, ' + s0.unfollows + ' unfollows.');
+    UI.log(TITLE + ' loaded. Today: ' + s0.follows + ' follows, ' + s0.pending + ' pending, ' + s0.unfollows + ' unfollows.');
 
     UI.buttons.follow.addEventListener('click', () => Automator.startFollowLoop());
     UI.buttons.unfollow.addEventListener('click', () => Automator.startUnfollowLoop());

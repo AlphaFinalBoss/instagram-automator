@@ -40,6 +40,8 @@ The tool falls back to the DOM scraping path if the API is unavailable (missing 
 
 **Three steps, no config.** Sync, then unfollow. Sensible defaults are already safe. You don't need to touch the settings unless you want to.
 
+**Follow loop that respects private accounts.** When you follow a private account, Instagram shows "Requested" instead of "Following". That's not a follow yet, it's a pending request. The tool tracks these separately: they don't count toward your daily follow cap, and they get reconciled automatically on your next Following sync. If the person accepts, the request is promoted to a real follow in history. If they don't, it stays pending until you look.
+
 **Human-like clicks.** Each follow and unfollow fires a full pointer cascade (pointerover, mousedown, mouseup, click) with a few pixels of random jitter on the coordinates. It's still a synthetic click, but it doesn't look like a bot hammering a button.
 
 **Rate-limit protection built in.** Configurable batch size, batch delay, daily cap for follows and unfollows tracked separately, and a session target. Safe Mode runs 6 actions then pauses 5 minutes, stops after 20 follows total. That matches Instagram's real cooldown window.
@@ -79,7 +81,7 @@ Better if you use it regularly. It loads automatically on every Instagram visit.
 // ==UserScript==
 // @name         Instagram Automator
 // @namespace    https://github.com/AlphaFinalBoss/instagram-automator
-// @version      2.2
+// @version      2.3
 // @description  Sync followers/following via IG API, unfollow non-followers with auto-blacklist.
 // @match        https://www.instagram.com/*
 // @grant        none
@@ -140,10 +142,11 @@ Everything lives in `localStorage`, keys prefixed with `sa_`:
 | Key ↕▾ | Contents ↕▾ |
 |---|---|
 | −`sa_blacklist` | Usernames you've unfollowed or manually blacklisted |
-| −`sa_follow_history` | `{ username: timestamp }` for accounts you followed with this tool |
+| `sa_follow_history` | `{ username: timestamp }` for confirmed follows |
+| `sa_pending_requests` | `{ username: timestamp }` for pending (private) requests |
 | `sa_my_followers` | Who follows you, from the last sync |
 | `sa_my_following` | Who you follow, from the last sync |
-| `sa_daily_stats` | `{ date, follows, unfollows }`, resets daily |
+| `sa_daily_stats` | `{ date, follows, pending, unfollows }`, resets daily |
 | `sa_settings` | Your preset and custom values |
 | `sa_last_sync` | Timestamps of the last sync for each list |
 ⚙
@@ -161,6 +164,8 @@ To wipe everything, open the console and run `localStorage.clear()`. Note this a
 **The panel disappeared after reload.** Console paste doesn't persist. Re-paste, or switch to Tampermonkey.
 
 **"No modal found".** Open the Followers or Following modal in Instagram first, then click the button.
+
+**A follow got counted as "pending".** That's a private account. Instagram is holding your request until they accept. It will be promoted to a real follow on your next Following sync if they accept.
 
 ## Project layout
 
