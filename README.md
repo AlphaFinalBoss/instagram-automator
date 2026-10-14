@@ -53,6 +53,10 @@ The tool falls back to the DOM scraping path if the API is unavailable (missing 
 - Everyone you unfollow because they didn't follow back. They are blacklisted only after the unfollow is confirmed (the button flips back to "Follow").
 - Everyone who follows you but you don't follow back. They are blacklisted after each sync, so the follow loop never follows them.
 
+**Whitelist.** Usernames on the whitelist are never unfollowed, even if they don't follow you back (brands, friends without a follow-back, etc.). They show up as `PROTECTED (whitelist)` in the log.
+
+**Finishes the whole list.** The unfollow loop works from the full non-follower list it got from the API, not from what the modal happens to show. It only stops when every eligible account is handled. If Instagram's modal stops loading more rows partway down, the loop types each remaining username into the modal's search box and unfollows it from there. Anyone it still can't find is listed by name in the log.
+
 **Mutual follower protection.** Anyone who follows you is skipped with `PROTECTED (follows you)` in the log. The unfollow loop doesn't trust an old sync: it re-fetches your Followers list from the API when it starts and again after every batch pause, and re-checks each account right before clicking. If that refresh fails, it refuses to run.
 
 **New-follow protection.** Nobody is unfollowed within 24 hours of being followed, so they get a fair chance to follow back. This covers follows made by the script and follows you made yourself (on your phone, say): the tool records when each account first shows up in a Following sync. Accounts that appeared after your last Following sync are always skipped, because their age is unknown.
@@ -137,7 +141,7 @@ Under the Advanced drawer:
 - **Batch Size:** how many actions before a long pause.
 - **Batch Delay:** how long that pause is, in seconds.
 - **Show debug logs:** verbose output. Adds API pagination details, stall events and target parsing to the log. Off by default.
-- **Manual blacklist input:** type a username and it goes straight into the blacklist.
+- **Whitelist / Blacklist inputs:** type one or more usernames (separated by spaces or commas). `+ Whitelist` protects them from unfollows, `+ Blacklist` stops the follow loop from ever following them. The `−` button next to each removes the names you typed from that list. The counts are shown above the inputs.
 - **Export / Clear Blacklist:** downloads the blacklist as JSON, and optionally wipes it.
 
 ## Data it stores
@@ -147,6 +151,7 @@ Everything lives in `localStorage`, keys prefixed with `sa_`:
 | Key | Contents |
 |---|---|
 | `sa_blacklist` | Usernames you've unfollowed, followers you don't follow back, and manual entries |
+| `sa_whitelist` | Usernames that are never unfollowed |
 | `sa_follow_history` | `{ username: timestamp }` for confirmed follows |
 | `sa_pending_requests` | `{ username: timestamp }` for pending (private) requests |
 | `sa_my_followers` | Who follows you, from the last sync |
