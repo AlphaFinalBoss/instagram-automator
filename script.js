@@ -1,5 +1,5 @@
 /* =========================================================================
- * Instagram Automator v2.3
+ * Instagram Automator v2.4
  * -------------------------------------------------------------------------
  * A self-contained, vanilla-JS console / userscript automator for
  * Instagram follow / unfollow workflows.
@@ -37,7 +37,7 @@
   /* ------------------------------------------------------------------ */
   if (window.SA_Automator) return; // Prevent double injection.
 
-  const VERSION = '2.3';
+  const VERSION = '2.4';
   const TITLE = 'Instagram Automator v' + VERSION;
 
   /* ------------------------------------------------------------------ */

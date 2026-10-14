@@ -86,7 +86,7 @@ Better if you use it regularly. It loads automatically on every Instagram visit.
 // ==UserScript==
 // @name         Instagram Automator
 // @namespace    https://github.com/AlphaFinalBoss/instagram-automator
-// @version      2.3
+// @version      2.4
 // @description  Sync followers/following via IG API, unfollow non-followers with auto-blacklist.
 // @match        https://www.instagram.com/*
 // @grant        none
