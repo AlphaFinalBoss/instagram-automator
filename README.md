@@ -14,7 +14,7 @@ You open Instagram, paste the script in the browser console, and get a floating 
 2. Click **Sync Following** to pull everyone you follow.
 3. Click **Unfollow Non-Followers** to remove the people who don't follow you back.
 
-Everything else happens automatically. Every unfollow is spaced out with random delays, mutual followers are never touched, and each account goes into a blacklist so it can't sneak back into your following later.
+Everything else happens automatically. Every unfollow is spaced out with random delays, mutual followers are never touched, accounts you followed less than 24 hours ago are left alone, and each unfollowed account goes into a blacklist so it can't sneak back into your following later.
 
 ## Why this approach
 
@@ -48,9 +48,14 @@ The tool falls back to the DOM scraping path if the API is unavailable (missing 
 
 **Silent rollback detection.** Instagram sometimes accepts a follow click and quietly reverts it 2 seconds later without showing you an error. The tool waits, re-reads the button, and if it has flipped back to "Follow", stops the whole run and plays an alert. That's your signal to close the tab and try tomorrow.
 
-**Auto-blacklist.** Every unfollowed account is saved to `localStorage`. The follow loop checks the blacklist before every action, so once someone is out, they stay out.
+**Auto-blacklist.** The follow loop checks the blacklist before every action, so once someone is out, they stay out. Two groups go in automatically:
 
-**Mutual follower protection.** Anyone who follows you back is skipped with `PROTECTED (mutual follow)` in the log. The tool refuses to run the unfollow loop if you haven't synced your followers first, because without that list it can't tell who's mutual.
+- Everyone you unfollow because they didn't follow back. They are blacklisted only after the unfollow is confirmed (the button flips back to "Follow").
+- Everyone who follows you but you don't follow back. They are blacklisted after each sync, so the follow loop never follows them.
+
+**Mutual follower protection.** Anyone who follows you is skipped with `PROTECTED (follows you)` in the log. The unfollow loop doesn't trust an old sync: it re-fetches your Followers list from the API when it starts and again after every batch pause, and re-checks each account right before clicking. If that refresh fails, it refuses to run.
+
+**New-follow protection.** Nobody is unfollowed within 24 hours of being followed, so they get a fair chance to follow back. This covers follows made by the script and follows you made yourself (on your phone, say): the tool records when each account first shows up in a Following sync. Accounts that appeared after your last Following sync are always skipped, because their age is unknown.
 
 **Everything is local.** State lives in your browser's `localStorage`. Nothing is sent anywhere except to instagram.com through the requests the tool itself makes.
 
@@ -97,13 +102,13 @@ Better if you use it regularly. It loads automatically on every Instagram visit.
 
 Three buttons, in order.
 
-**Sync Followers.** Click it. Takes a few seconds. The status line updates to show your follower count. If you don't do this first, the unfollow loop will refuse to run.
+**Sync Followers.** Click it. Takes a few seconds. The status line updates to show your follower count. No modal needs to be open.
 
-**Sync Following.** Click it. Same thing, for the people you follow.
+**Sync Following.** Click it. Same thing, for the people you follow. The unfollow loop refuses to run until you've done this, because it needs the list to know how long you've followed each account.
 
-**Unfollow Non-Followers.** Click it. A confirmation dialog shows how many accounts will be removed and previews the first ten names. Confirm, then the tool opens the Following modal and works through the list. Each unfollow takes 3-6 seconds, with a 5-minute pause after every 6 actions in Safe Mode.
+**Unfollow Non-Followers.** Open your Following modal on Instagram, then click it. The tool refreshes your Followers list, logs how many accounts are eligible, and works through the list. The log shows why each account is skipped (`PROTECTED (follows you)`, `SKIP (followed 5h ago, cooldown 24h)`). Each unfollow takes 3-6 seconds, with a 5-minute pause after every 6 actions in Safe Mode.
 
-Press **Stop / Pause** any time. Whatever's already done stays done.
+Press **Stop / Pause** any time. A follow or unfollow that was already clicked is still verified and recorded. Whatever's already done stays done.
 
 ## Safe Mode and Fast Mode
 
@@ -139,17 +144,17 @@ Under the Advanced drawer:
 
 Everything lives in `localStorage`, keys prefixed with `sa_`:
 
-| Key ↕▾ | Contents ↕▾ |
+| Key | Contents |
 |---|---|
-| −`sa_blacklist` | Usernames you've unfollowed or manually blacklisted |
+| `sa_blacklist` | Usernames you've unfollowed, followers you don't follow back, and manual entries |
 | `sa_follow_history` | `{ username: timestamp }` for confirmed follows |
 | `sa_pending_requests` | `{ username: timestamp }` for pending (private) requests |
 | `sa_my_followers` | Who follows you, from the last sync |
 | `sa_my_following` | Who you follow, from the last sync |
+| `sa_following_seen` | `{ username: timestamp }` when each account first appeared in a Following sync (0 = already there before this feature) |
 | `sa_daily_stats` | `{ date, follows, pending, unfollows }`, resets daily |
 | `sa_settings` | Your preset and custom values |
 | `sa_last_sync` | Timestamps of the last sync for each list |
-⚙
 
 To wipe everything, open the console and run `localStorage.clear()`. Note this also clears any other site data on instagram.com.
 
@@ -157,7 +162,9 @@ To wipe everything, open the console and run `localStorage.clear()`. Note this a
 
 **"Sync failed: NO_CSRF"** or **"API unavailable".** Instagram's session cookies weren't readable. Usually this means you're not logged in, or an extension is stripping cookies. Brave Shields is fine as-is (the cookies we need are first-party). Try a private window with extensions off to narrow it down. If the API is truly unreachable, the tool falls back to the DOM path automatically.
 
-**"Refusing to run: Followers list is empty".** You clicked Unfollow before syncing Followers. This is a safety guard. Without the follower list, the tool has no way to know who's a mutual. Sync Followers first.
+**"Refusing to run: Following list is empty".** You clicked Unfollow before syncing Following. Sync Following first, so the tool knows how long you've followed each account.
+
+**"Refusing to run: Followers refresh via API failed".** The unfollow loop couldn't fetch a fresh Followers list, so it can't safely tell who's a mutual. Check that you're logged in, wait a few minutes, and try again.
 
 **"RATE LIMIT DETECTED (Silent Rollback)".** Instagram is quietly reverting your follows. Stop for the day. Next time, try a lower Session Target, maybe 10 instead of 20.
 

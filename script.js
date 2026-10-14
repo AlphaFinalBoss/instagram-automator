@@ -132,6 +132,7 @@
     stats: 'sa_daily_stats',
     myFollowers: 'sa_my_followers',
     following: 'sa_my_following',
+    followingSeen: 'sa_following_seen',
     lastSync: 'sa_last_sync',
     settings: 'sa_settings'
   };
@@ -155,17 +156,34 @@
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
   }
 
+  // Instagram usernames are case-insensitive; every comparison goes through this.
+  function norm(username) {
+    return String(username || '').trim().replace(/^@+/, '').toLowerCase();
+  }
+
+  function readNameSet(key) {
+    const arr = readJSON(key, []);
+    return new Set((Array.isArray(arr) ? arr : []).map(norm).filter(Boolean));
+  }
+
   const Store = {
     /* ---- blacklist ---- */
     getBlacklist() {
-      const arr = readJSON(KEYS.blacklist, []);
-      return new Set(Array.isArray(arr) ? arr : []);
+      return readNameSet(KEYS.blacklist);
     },
     addBlacklist(username) {
+      username = norm(username);
       if (!username) return;
       const set = Store.getBlacklist();
       set.add(username);
       writeJSON(KEYS.blacklist, Array.from(set));
+    },
+    addBlacklistMany(usernames) {
+      const set = Store.getBlacklist();
+      const before = set.size;
+      for (const u of usernames) { const n = norm(u); if (n) set.add(n); }
+      if (set.size !== before) writeJSON(KEYS.blacklist, Array.from(set));
+      return set.size - before;
     },
     removeBlacklist(username) {
       const set = Store.getBlacklist();
@@ -178,8 +196,7 @@
 
     /* ---- mutual followers (accounts that follow me) ---- */
     getMyFollowers() {
-      const arr = readJSON(KEYS.myFollowers, []);
-      return new Set(Array.isArray(arr) ? arr : []);
+      return readNameSet(KEYS.myFollowers);
     },
     setMyFollowers(array) {
       const arr = Array.isArray(array) ? array : Array.from(array || []);
@@ -188,13 +205,40 @@
     },
 
     getMyFollowing() {
-      const arr = readJSON(KEYS.following, []);
-      return new Set(Array.isArray(arr) ? arr : []);
+      return readNameSet(KEYS.following);
     },
     setMyFollowing(array) {
       const arr = Array.isArray(array) ? array : Array.from(array || []);
+      Store.updateFollowingSeen(arr);
       writeJSON(KEYS.following, arr);
       return arr;
+    },
+
+    /* ---- first time each followed account appeared in a Following sync ---- */
+    // Catches follows made outside the script (manually, from the phone),
+    // so they get the same unfollow cooldown as script follows.
+    getFollowingSeen() {
+      const obj = readJSON(KEYS.followingSeen, null);
+      return obj && typeof obj === 'object' ? obj : null;
+    },
+    updateFollowingSeen(currentFollowing) {
+      let seen = Store.getFollowingSeen();
+      const now = Date.now();
+      if (!seen) {
+        // First run with this feature: accounts already in the previous sync
+        // are treated as old (0); anything new since then starts its clock now.
+        const previous = Store.getMyFollowing();
+        seen = {};
+        for (const u of currentFollowing) seen[norm(u)] = previous.size && !previous.has(norm(u)) ? now : 0;
+      } else {
+        const next = {};
+        for (const u of currentFollowing) {
+          const k = norm(u);
+          next[k] = typeof seen[k] === 'number' ? seen[k] : now;
+        }
+        seen = next;
+      }
+      writeJSON(KEYS.followingSeen, seen);
     },
 
     getLastSync() {
@@ -213,15 +257,16 @@
       const obj = readJSON(KEYS.history, {});
       return obj && typeof obj === 'object' ? obj : {};
     },
-    setFollow(username) {
+    setFollow(username, ts) {
+      username = norm(username);
       if (!username) return;
       const h = Store.getHistory();
-      h[username] = Date.now();
+      h[username] = typeof ts === 'number' ? ts : Date.now();
       writeJSON(KEYS.history, h);
     },
     removeHistory(username) {
       const h = Store.getHistory();
-      delete h[username];
+      delete h[norm(username)];
       writeJSON(KEYS.history, h);
     },
 
@@ -230,6 +275,7 @@
       return obj && typeof obj === 'object' ? obj : {};
     },
     setPendingRequest(username) {
+      username = norm(username);
       if (!username) return;
       const p = Store.getPendingRequests();
       p[username] = Date.now();
@@ -237,8 +283,9 @@
     },
     removePendingRequest(username) {
       const p = Store.getPendingRequests();
-      if (p[username]) {
-        delete p[username];
+      const k = norm(username);
+      if (p[k]) {
+        delete p[k];
         writeJSON(KEYS.pending, p);
       }
     },
@@ -441,7 +488,7 @@
         borderRadius: '6px', fontWeight: '600', cursor: 'pointer', fontSize: '11px', flex: '1'
       });
       function addManualBlacklist() {
-        const value = (blInput.value || '').trim().replace(/@/g, '');
+        const value = norm(blInput.value);
         if (!value) return;
         Store.addBlacklist(value);
         log('Manual blacklist -> ' + value);
@@ -936,7 +983,14 @@
       const now = Date.now();
       if (now - Automator.lastBlockCheck < 1500) return false;
       Automator.lastBlockCheck = now;
-      const text = (document.body.innerText || '').toLowerCase();
+      // Skip our own panel: its log quotes the block phrases, which would
+      // otherwise re-trigger a stop on every later run.
+      let text = '';
+      for (const child of document.body.children) {
+        if (child.id === 'sa-panel') continue;
+        text += ' ' + (child.innerText || '');
+      }
+      text = text.toLowerCase();
       for (const phrase of BLOCK_PHRASES) {
         if (text.indexOf(phrase) !== -1) {
           Automator.triggerBlock(phrase);
@@ -1020,13 +1074,19 @@
       if (!username) return null;
       const scope = Automator.findDialog() || document;
       const buttons = scope.querySelectorAll('button, div[role="button"]');
-      const labels = FOLLOW_SUCCESS_LABELS.concat(FOLLOW_FAILURE_LABELS);
+      const labels = FOLLOW_SUCCESS_LABELS.concat(FOLLOW_FAILURE_LABELS, ['follow back']);
       for (const b of buttons) {
         const txt = (b.textContent || '').trim().toLowerCase();
         if (labels.indexOf(txt) === -1) continue;
-        if (Automator.usernameFor(b) === username) return b;
+        if (norm(Automator.usernameFor(b)) === norm(username)) return b;
       }
       return null;
+    },
+
+    // Plain wait that Stop cannot cut short. Used after a click has already
+    // been sent, so the result is always recorded even if Stop is pressed.
+    wait(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
     },
 
     // Returns { success, text }. Success requires the button to have settled
@@ -1040,7 +1100,8 @@
 
     /* ---- perform one follow ---- */
     async doFollow(button, username) {
-      if (!username) username = 'user_' + Date.now();
+      username = norm(username);
+      if (!username) return 0;
 
       const blacklist = Store.getBlacklist();
       if (blacklist.has(username)) { UI.log('SKIP (blacklist): ' + username); return 0; }
@@ -1051,11 +1112,18 @@
 
       Automator.simulateHumanClick(button);
 
-      await Automator.sleep(CONFIG.followVerifyDelay, 'Verifying');
-      if (Automator.stopped) return 0;
+      // The click is out; always verify and record it, even if Stop is pressed
+      // meanwhile. A follow that is not recorded has no cooldown protection.
+      UI.setCountdown('Verifying...');
+      await Automator.wait(CONFIG.followVerifyDelay);
+      UI.setCountdown('');
 
       const state = Automator.resolveFollowState(button, username);
       if (!state.success) {
+        if (Automator.stopped) {
+          UI.log('Follow not confirmed for ' + username + ' (stopped).');
+          return 0;
+        }
         Automator.triggerRateLimit('button state: "' + (state.text || 'unknown') + '"');
         return 0;
       }
@@ -1077,22 +1145,93 @@
     },
 
     /* ---- perform one unfollow ---- */
-    async doUnfollow(button, username) {
+    async doUnfollow(button, username, reason) {
+      username = norm(username);
       if (!username) return 0;
       Automator.simulateHumanClick(button);
-      await Automator.sleep(600, 'Confirming');
+      await Automator.wait(600);
 
       const confirm = Automator.getButtons(document, ['Unfollow', 'Confirm'])[0];
       if (confirm) Automator.simulateHumanClick(confirm);
 
-      // Permanently blacklist and forget the follow record.
+      // The click is out; always verify, even if Stop is pressed meanwhile.
+      UI.setCountdown('Verifying...');
+      await Automator.wait(CONFIG.followVerifyDelay);
+      UI.setCountdown('');
+
+      const el = (button && button.isConnected) ? button : Automator.findFollowStateButton(username);
+      const text = el ? (el.textContent || '').trim().toLowerCase() : '';
+      if (text === 'following' || text === 'requested') {
+        // Still followed: the unfollow did not go through. Do not blacklist.
+        if (!Automator.stopped) Automator.triggerRateLimit('unfollow did not stick for ' + username);
+        return 0;
+      }
+
+      // Unfollowed (button is back to "Follow"), or the row is gone and we
+      // cannot read it. Either way: blacklist so it is never followed again.
       Store.addBlacklist(username);
       Store.removeHistory(username);
+      Store.removePendingRequest(username);
       const count = Store.incrementUnfollows();
       UI.updateToday();
-      const wasBlacklisted = Store.getBlacklist().has(username);
-      UI.log('UNFOLLOW #' + count + (wasBlacklisted ? ' (was blacklisted)' : ' (>24h aged)') + ' -> ' + username);
+      UI.log('UNFOLLOW #' + count + ' (' + reason + (text ? '' : ', unverified') + ') + blacklist -> ' + username);
       return 1;
+    },
+
+    /* ---- unfollow eligibility ---- */
+    // When this account most recently entered our following: a script follow,
+    // a pending request, or the first Following sync that saw it.
+    // The script's own record wins; the sync timestamp only covers follows
+    // made outside the script (it is later than the real follow time).
+    followedAt(username, history, pending, seen) {
+      const k = norm(username);
+      const own = [history[k], pending[k]].filter(t => typeof t === 'number');
+      if (own.length) return Math.max.apply(null, own);
+      return seen && typeof seen[k] === 'number' ? seen[k] : null;
+    },
+
+    // Returns { ok: true, reason } or { ok: false, why }.
+    unfollowVerdict(username, ctx) {
+      const k = norm(username);
+      if (ctx.followers.has(k)) return { ok: false, why: 'PROTECTED (follows you)' };
+      if (!ctx.following.has(k)) return { ok: false, why: 'SKIP (followed after last Following sync, too new)' };
+      const at = Automator.followedAt(k, ctx.history, ctx.pending, ctx.seen);
+      if (at !== null && ctx.now - at < ctx.cooldownMs) {
+        const hours = Math.floor((ctx.now - at) / 3600000);
+        return { ok: false, why: 'SKIP (followed ' + hours + 'h ago, cooldown ' + CONFIG.unfollowCooldownHours + 'h)' };
+      }
+      return { ok: true, reason: ctx.blacklist.has(k) ? 'blacklist' : 'non-follower' };
+    },
+
+    // Fresh Followers list straight from the API, so anyone who followed back
+    // since the last manual sync is protected. Returns false if it failed.
+    async refreshFollowers() {
+      UI.setStatus('Refreshing Followers (protect new follow-backs)...');
+      const list = await Automator.scanViaApi('followers', 0);
+      if (list === null) return false;
+      Store.setMyFollowers(list);
+      Store.setLastSync('followers', Date.now());
+      Automator.autoBlacklistUnreciprocated();
+      UI.updateNetworkCounts();
+      UI.updateSyncStatus();
+      UI.logDebug('Followers refreshed: ' + list.length + '.');
+      return true;
+    },
+
+    // People who follow you but you do not follow back: blacklist them so
+    // the follow loop never follows them. Needs both lists synced.
+    autoBlacklistUnreciprocated() {
+      const followers = Store.getMyFollowers();
+      const following = Store.getMyFollowing();
+      if (!followers.size || !following.size) return 0;
+      const pending = Store.getPendingRequests();
+      const targets = [];
+      for (const u of followers) {
+        if (!following.has(u) && !pending[u]) targets.push(u);
+      }
+      const added = Store.addBlacklistMany(targets);
+      if (added > 0) UI.log('Blacklisted ' + added + ' follower' + (added === 1 ? '' : 's') + ' you do not follow back.');
+      return added;
     },
 
     detectFollowerTarget() {
@@ -1306,32 +1445,34 @@
     },
 
     /* ---- scan my own followers (mutual protection list) ---- */
-    async scanCurrentList() {
+    // kind: 'followers' | 'following', set by the button that was pressed.
+    async scanCurrentList(kind) {
       if (Automator.running) {
         UI.log('A loop is running. Press Stop before scanning.');
         return;
       }
+      Automator.running = true;
+      Automator.stopped = false;
+      try {
+        await Automator._scanList(kind);
+      } finally {
+        Automator.running = false;
+      }
+    },
 
-      // Detect which modal is open (followers vs following) and pick the
-      // matching storage target. Fall back to the page URL when no modal is
-      // present (the API path does not need the dialog at all).
+    async _scanList(kind) {
       const dialog = Automator.findDialog();
-      let isFollowingModal = false;
-      let storeKey;
-      if (dialog) {
-        const dialogTitle = (dialog.innerText || '').slice(0, 60).toLowerCase();
-        isFollowingModal = /^following\b/.test(dialogTitle);
-        storeKey = isFollowingModal ? 'following' : 'followers';
-      } else if (location.pathname.indexOf('/followers') !== -1) {
-        storeKey = 'followers';
-      } else if (location.pathname.indexOf('/following') !== -1) {
-        storeKey = 'following';
-      } else {
+      const dialogTitle = dialog ? (dialog.innerText || '').slice(0, 60).toLowerCase() : '';
+      const dialogKind = !dialog ? null : (/^following\b/.test(dialogTitle) ? 'following' : 'followers');
+      const storeKey = kind || dialogKind;
+      if (!storeKey) {
         UI.log('Open the Followers or Following modal first.');
         return;
       }
+      const isFollowingModal = storeKey === 'following';
 
-      const expectedTargetCache = Automator.detectFollowerTarget();
+      // The header count is only meaningful when the matching modal is open.
+      const expectedTargetCache = dialogKind === storeKey ? Automator.detectFollowerTarget() : 0;
 
       UI.log('Scanning your ' + storeKey + ' list...');
 
@@ -1345,11 +1486,12 @@
         }
         if (storeKey === 'following') {
           const pending = Store.getPendingRequests();
-          const followingSet = new Set(apiResult.map(u => u.toLowerCase()));
+          const followingSet = new Set(apiResult.map(norm));
           let confirmed = 0;
           for (const username in pending) {
-            if (followingSet.has(username.toLowerCase())) {
-              // Request was accepted: promote to confirmed follow.
+            if (followingSet.has(norm(username))) {
+              // Request was accepted: promote to confirmed follow. The
+              // cooldown starts now, giving them time to follow back.
               Store.setFollow(username);
               delete pending[username];
               confirmed++;
@@ -1365,6 +1507,7 @@
           }
         }
         Store.setLastSync(storeKey, Date.now());
+        Automator.autoBlacklistUnreciprocated();
         const expected = expectedTargetCache || 0;
         if (expected > 0) {
           const diff = expected - apiResult.length;
@@ -1384,9 +1527,9 @@
       }
 
       // Fallback: DOM scraping for edge cases (missing cookies, API failure).
-      if (!dialog) {
-        UI.setStatus('Open your Followers modal first.');
-        UI.log('No modal found for DOM fallback scan.');
+      if (!dialog || dialogKind !== storeKey) {
+        UI.setStatus('Open your ' + storeKey + ' modal first.');
+        UI.log('API failed. For the DOM fallback, open your ' + storeKey + ' modal and press Sync again.');
         return;
       }
       const scroller = Automator.findScrollContainer(dialog);
@@ -1511,82 +1654,43 @@
       }
 
       Store.setLastSync(storeKey, Date.now());
-    },
-
-    blacklistNonFollowers() {
-      const following = Store.getMyFollowing();
-      const followers = Store.getMyFollowers();
-      if (following.size === 0) {
-        UI.setStatus('Sync your Following list first.');
-        UI.log('Cannot blacklist: Following list is empty. Run [Sync Following] first.');
-        return 0;
-      }
-      if (followers.size === 0) {
-        UI.setStatus('Sync your Followers list first.');
-        UI.log('Cannot blacklist: Followers list is empty. Run [Sync Followers] first.');
-        return 0;
-      }
-      const blacklist = Store.getBlacklist();
-      const targets = [];
-      for (const u of following) {
-        if (followers.has(u)) continue;
-        if (blacklist.has(u)) continue;
-        targets.push(u);
-      }
-      if (targets.length === 0) {
-        UI.setStatus('Nothing to blacklist.');
-        UI.log('No new non-followers to blacklist.');
-        return 0;
-      }
-      const preview = targets.slice(0, 10).join(', ');
-      const more = targets.length > 10 ? ' ... (+' + (targets.length - 10) + ' more)' : '';
-      const ok = confirm(
-        'Blacklist ' + targets.length + ' accounts you follow but who do not follow back?\n\n' +
-        preview + more + '\n\n' +
-        'These accounts will never be auto-followed again.\n\nThey have been queued for the next [Start Unfollow >24h] run. Open your Following modal and press that button to actually unfollow them.'
-      );
-      if (!ok) {
-        UI.log('Blacklist cancelled by user.');
-        return 0;
-      }
-      const backdated = Date.now() - (CONFIG.unfollowCooldownHours + 1) * 3600 * 1000;
-      const history = Store.getHistory();
-      let historyAdded = 0;
-      for (const u of targets) {
-        blacklist.add(u);
-        if (!history[u]) {
-          history[u] = backdated;
-          historyAdded++;
-        } else if (Date.now() - history[u] <= CONFIG.unfollowCooldownHours * 3600 * 1000) {
-          // Already in history but too recent; backdate it so unfollow can act.
-          history[u] = backdated;
-          historyAdded++;
-        }
-      }
-      writeJSON(KEYS.blacklist, Array.from(blacklist));
-      writeJSON(KEYS.history, history);
-      UI.log('Blacklisted ' + targets.length + ' non-followers.');
-      if (historyAdded > 0) {
-        UI.log(historyAdded + ' queued for unfollow (next [Start Unfollow] run).');
-      }
-      UI.setStatus('Blacklisted ' + targets.length + ' accounts.');
+      Automator.autoBlacklistUnreciprocated();
       UI.updateToday();
-      return targets.length;
     },
 
-    /* ---- FOLLOW LOOP ---- */
-    async startFollowLoop() {
+    /* ---- loop runner ---- */
+    // Holds the running flag until a loop has really finished. Stop only sets
+    // `stopped`, so a new run cannot start while the old one is still winding
+    // down, and a crash cannot leave `running` stuck on true.
+    async runExclusive(fn) {
       if (Automator.running) { UI.log('Already running. Press Stop first.'); return; }
       Automator.running = true;
       Automator.stopped = false;
       UI.setWarning('');
+      try {
+        await fn();
+      } catch (e) {
+        Automator.stopped = true;
+        UI.setStatus('Stopped (error).');
+        UI.log('Error: ' + (e && e.message ? e.message : e) + '. Loop stopped.');
+      } finally {
+        Automator.running = false;
+        UI.setCountdown('');
+      }
+    },
+
+    /* ---- FOLLOW LOOP ---- */
+    startFollowLoop() {
+      return Automator.runExclusive(Automator._followLoop);
+    },
+
+    async _followLoop() {
       UI.log('Start FOLLOW loop.');
 
       const dialog = Automator.findDialog();
       if (!dialog) {
         UI.setStatus('Open a list (Following/Followers) in a modal.');
         UI.log('No modal found. Open the list and try again.');
-        Automator.running = false;
         return;
       }
       const scroller = Automator.findScrollContainer(dialog);
@@ -1598,6 +1702,8 @@
       // list from re-evaluating (or getting stuck on) remounted rows.
       const processedThisRun = new Set();
       const skippableLabels = SELECTORS.skippableButtonText.map(s => s.toLowerCase());
+      // "Follow Back" rows are read too, so they get blacklisted below.
+      const readLabels = SELECTORS.followButtonText.concat(['Follow Back']);
 
       let actionCount = 0;
       let followsThisSession = 0;
@@ -1618,43 +1724,43 @@
         const myFollowers = Store.getMyFollowers();
         const blacklist = Store.getBlacklist();
         const history = Store.getHistory();
+        const pending = Store.getPendingRequests();
 
         // ---- Step A: read all currently mounted buttons in the container ----
-        const buttons = Automator.getButtons(scroller, SELECTORS.followButtonText);
+        const buttons = Automator.getButtons(scroller, readLabels);
         const targets = [];
         for (const btn of buttons) {
           if (Automator.stopped) break;
 
           const label = (btn.textContent || '').trim().toLowerCase();
-          const username = Automator.usernameFor(btn);
+          const username = norm(Automator.usernameFor(btn));
           if (!username) continue;               // Row not hydrated yet: retry next pass.
 
-          const key = username.toLowerCase();
-          if (processedThisRun.has(key)) continue;
+          if (processedThisRun.has(username)) continue;
 
           // Someone who already follows us: protect + blacklist, never revisit.
           if (label === 'follow back' || myFollowers.has(username)) {
             UI.log('SKIP + blacklist (follows you): ' + username);
             Store.addBlacklist(username);
-            processedThisRun.add(key);
+            processedThisRun.add(username);
             continue;
           }
           if (skippableLabels.indexOf(label) !== -1) {
-            processedThisRun.add(key);
+            processedThisRun.add(username);
             continue;
           }
           if (blacklist.has(username)) {
             UI.log('SKIP blacklist: ' + username);
-            processedThisRun.add(key);
+            processedThisRun.add(username);
             continue;
           }
-          if (history[username]) {
+          if (history[username] || pending[username]) {
             UI.log('SKIP already followed: ' + username);
-            processedThisRun.add(key);
+            processedThisRun.add(username);
             continue;
           }
 
-          targets.push({ btn, username, key });
+          targets.push({ btn, username });
         }
 
         // ---- Step B: process every eligible user in the current view ----
@@ -1663,7 +1769,7 @@
             if (Automator.stopped || Automator.dailyCapReached('follows')) break;
             if (Automator.checkBlocked()) break;
 
-            processedThisRun.add(target.key);
+            processedThisRun.add(target.username);
             UI.setStatus('Follow: ' + target.username);
             const did = await Automator.doFollow(target.btn, target.username);
             if (Automator.stopped) break;
@@ -1698,25 +1804,33 @@
         }
       }
 
-      Automator.running = false;
       if (!Automator.stopped) UI.setStatus('Follow loop finished.');
-      UI.setCountdown('');
     },
 
-    /* ---- UNFOLLOW LOOP (>24h, non-followers only) ---- */
-    async startUnfollowLoop() {
-      if (Automator.running) { UI.log('Already running. Press Stop first.'); return; }
-      Automator.running = true;
-      Automator.stopped = false;
-      UI.setWarning('');
-      UI.log('Start UNFOLLOW loop (non-followers + blacklisted).');
+    /* ---- UNFOLLOW LOOP (non-followers, older than the cooldown) ---- */
+    startUnfollowLoop() {
+      return Automator.runExclusive(Automator._unfollowLoop);
+    },
 
-      const myFollowersCheck = Store.getMyFollowers();
-      if (myFollowersCheck.size === 0) {
-        UI.setStatus('Sync your Followers list first.');
-        UI.log('Refusing to run: Followers list is empty. Mutual followers would not be protected.');
-        UI.log('Go to STEP 1 and press [Sync Followers] first.');
-        Automator.running = false;
+    unfollowContext() {
+      return {
+        followers: Store.getMyFollowers(),
+        following: Store.getMyFollowing(),
+        blacklist: Store.getBlacklist(),
+        history: Store.getHistory(),
+        pending: Store.getPendingRequests(),
+        seen: Store.getFollowingSeen(),
+        cooldownMs: CONFIG.unfollowCooldownHours * 3600 * 1000,
+        now: Date.now()
+      };
+    },
+
+    async _unfollowLoop() {
+      UI.log('Start UNFOLLOW loop (non-followers older than ' + CONFIG.unfollowCooldownHours + 'h).');
+
+      if (Store.getMyFollowing().size === 0) {
+        UI.setStatus('Sync your Following list first.');
+        UI.log('Refusing to run: Following list is empty. Press [Sync Following] first, so follow ages are known.');
         return;
       }
 
@@ -1724,11 +1838,24 @@
       if (!dialog) {
         UI.setStatus('Open the Following list in a modal.');
         UI.log('No modal found. Open the list and try again.');
-        Automator.running = false;
         return;
       }
+
+      // Always start from a fresh Followers list: someone who followed back
+      // an hour ago must not be unfollowed because of an old sync.
+      if (!(await Automator.refreshFollowers())) {
+        if (Automator.stopped) return;
+        UI.setStatus('Could not refresh Followers. Unfollow cancelled.');
+        UI.log('Refusing to run: Followers refresh via API failed, mutual followers would not be safely protected.');
+        return;
+      }
+      if (Store.getMyFollowers().size === 0) {
+        UI.setStatus('Followers list is empty. Unfollow cancelled.');
+        UI.log('Refusing to run: Followers list came back empty.');
+        return;
+      }
+
       const scroller = Automator.findScrollContainer(dialog);
-      const cooldownMs = CONFIG.unfollowCooldownHours * 3600 * 1000;
 
       // Start cleanly at the very top and let the first batch mount.
       await Automator.resetToTop(scroller, 500);
@@ -1736,12 +1863,12 @@
       // Usernames already inspected during this run.
       const processedThisRun = new Set();
 
-      const history = Store.getHistory();
+      const ctx0 = Automator.unfollowContext();
       let eligible = 0;
-      for (const u in history) {
-        if (Date.now() - history[u] > cooldownMs) eligible++;
+      for (const u of ctx0.following) {
+        if (Automator.unfollowVerdict(u, ctx0).ok) eligible++;
       }
-      UI.log('Accounts eligible for unfollow (>' + CONFIG.unfollowCooldownHours + 'h): ' + eligible);
+      UI.log('Eligible for unfollow (no follow-back, followed >' + CONFIG.unfollowCooldownHours + 'h ago): ' + eligible);
 
       let actionCount = 0;
       let searchCycles = 0;
@@ -1758,9 +1885,7 @@
           if (Automator.stopped) break;
         }
 
-        const myFollowers = Store.getMyFollowers();
-        const curHistory = Store.getHistory();
-        const curBlacklist = Store.getBlacklist();
+        const ctx = Automator.unfollowContext();
 
         // ---- Step A: read all currently mounted buttons in the container ----
         const buttons = Automator.getButtons(scroller, ['Following', 'Requested']);
@@ -1768,25 +1893,19 @@
         for (const btn of buttons) {
           if (Automator.stopped) break;
 
-          const username = Automator.usernameFor(btn);
+          const username = norm(Automator.usernameFor(btn));
           if (!username) continue;               // Row not hydrated yet: retry next pass.
 
-          const key = username.toLowerCase();
-          if (processedThisRun.has(key)) continue;
+          if (processedThisRun.has(username)) continue;
 
-          // Mutual followers are never touched.
-          if (myFollowers.has(username)) {
-            UI.log('PROTECTED (mutual follow): ' + username);
-            processedThisRun.add(key);
+          const verdict = Automator.unfollowVerdict(username, ctx);
+          if (!verdict.ok) {
+            UI.log(verdict.why + ': ' + username);
+            processedThisRun.add(username);
             continue;
           }
 
-          // Everyone else in the Following list is a non-follower.
-          const isBlacklisted = curBlacklist.has(username);
-          const ts = curHistory[username];
-          const source = isBlacklisted ? 'blacklist' : (ts ? 'aged' : 'non-follower');
-
-          targets.push({ btn, username, key, reason: source });
+          targets.push({ btn, username, reason: verdict.reason });
         }
 
         // ---- Step B: process every eligible user in the current view ----
@@ -1795,9 +1914,17 @@
             if (Automator.stopped || Automator.dailyCapReached('unfollows')) break;
             if (Automator.checkBlocked()) break;
 
-            processedThisRun.add(target.key);
+            // Re-check right before the click: the Followers list may have
+            // been refreshed during the last batch pause.
+            const verdict = Automator.unfollowVerdict(target.username, Automator.unfollowContext());
+            processedThisRun.add(target.username);
+            if (!verdict.ok) {
+              UI.log(verdict.why + ': ' + target.username);
+              continue;
+            }
+
             UI.setStatus('Unfollow (' + target.reason + '): ' + target.username + ' - Stop to abort');
-            const did = await Automator.doUnfollow(target.btn, target.username);
+            const did = await Automator.doUnfollow(target.btn, target.username, target.reason);
             if (Automator.stopped) break;
             if (did) {
               actionCount++;
@@ -1805,7 +1932,18 @@
               UI.setStatus('Waiting ' + Math.round(wait / 1000) + 's (jitter)...');
               await Automator.sleep(wait, 'Delay');
               if (Automator.stopped) break;
-              await Automator.batchPause(actionCount);
+              if (actionCount % CONFIG.actionsBatchSize === 0) {
+                await Automator.batchPause(actionCount);
+                if (Automator.stopped) break;
+                // Pick up anyone who followed back during the pause.
+                if (!(await Automator.refreshFollowers())) {
+                  if (!Automator.stopped) {
+                    UI.log('Followers refresh failed. Stopping to stay safe.');
+                    Automator.stop();
+                  }
+                  break;
+                }
+              }
             }
           }
           noNewRounds = 0;
@@ -1826,15 +1964,14 @@
         }
       }
 
-      Automator.running = false;
       if (!Automator.stopped) UI.setStatus('Unfollow loop finished.');
-      UI.setCountdown('');
     },
 
     /* ---- stop ---- */
+    // Only raises the flag. The running loop sees it within ~250ms, finishes
+    // the action already in flight, and clears `running` itself.
     stop() {
       Automator.stopped = true;
-      Automator.running = false;
       UI.setCountdown('');
     }
   };
@@ -1879,8 +2016,8 @@
 
     UI.buttons.follow.addEventListener('click', () => Automator.startFollowLoop());
     UI.buttons.unfollow.addEventListener('click', () => Automator.startUnfollowLoop());
-    UI.buttons.syncFollowers.addEventListener('click', () => Automator.scanCurrentList());
-    UI.buttons.syncFollowing.addEventListener('click', () => Automator.scanCurrentList());
+    UI.buttons.syncFollowers.addEventListener('click', () => Automator.scanCurrentList('followers'));
+    UI.buttons.syncFollowing.addEventListener('click', () => Automator.scanCurrentList('following'));
     UI.buttons.advancedToggle.addEventListener('click', () => {
       const box = UI.advancedBox;
       const open = box.style.display === 'block';
