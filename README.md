@@ -83,24 +83,15 @@ A dark panel shows up in the top-right corner of the page.
 Better if you use it regularly. It loads automatically on every Instagram visit.
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser.
-2. Create a new userscript in Tampermonkey.
-3. Paste the entire contents of `script.js` wrapped like this:
+2. Open the Tampermonkey dashboard, go to **Utilities**, and under **Import from URL** paste:
+   `https://raw.githubusercontent.com/AlphaFinalBoss/instagram-automator/main/script.js`
+3. Click **Install** on the page that opens.
 
-```javascript
-// ==UserScript==
-// @name         Instagram Automator
-// @namespace    https://github.com/AlphaFinalBoss/instagram-automator
-// @version      2.4
-// @description  Sync followers/following via IG API, unfollow non-followers with auto-blacklist.
-// @match        https://www.instagram.com/*
-// @grant        none
-// @run-at       document-idle
-// ==/UserScript==
+From now on the panel appears by itself whenever you open Instagram, and the script updates itself from GitHub. `script.js` already carries its own userscript header (`@updateURL` / `@downloadURL`), so there's nothing to wrap or paste.
 
-// paste the whole script.js here
-```
+**Updates.** Tampermonkey checks once a day by default. To pull a new version right away: Tampermonkey menu, **Check for userscript updates**. To check more often: dashboard, **Settings**, **Script Update**, **Check Interval**. Updates are only picked up when `@version` in the header goes up, so bump it together with `VERSION` on every release.
 
-4. Save. From now on the panel appears by itself whenever you open Instagram.
+**Already installed the old way (pasted with a hand-written header)?** Delete that script in Tampermonkey and install it from the URL above. Your blacklist, whitelist and history live in Instagram's `localStorage`, not in the script, so nothing is lost.
 
 ## How to use it
 

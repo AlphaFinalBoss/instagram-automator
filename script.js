@@ -1,5 +1,19 @@
+// ==UserScript==
+// @name         Instagram Automator
+// @namespace    https://github.com/AlphaFinalBoss/instagram-automator
+// @version      2.6
+// @description  Sync followers/following via IG API, unfollow non-followers with auto-blacklist.
+// @match        https://www.instagram.com/*
+// @grant        none
+// @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/AlphaFinalBoss/instagram-automator/main/script.js
+// @downloadURL  https://raw.githubusercontent.com/AlphaFinalBoss/instagram-automator/main/script.js
+// ==/UserScript==
+// Keep @version in sync with VERSION below: Tampermonkey only updates
+// when @version goes up.
+
 /* =========================================================================
- * Instagram Automator v2.5
+ * Instagram Automator v2.6
  * -------------------------------------------------------------------------
  * A self-contained, vanilla-JS console / userscript automator for
  * Instagram follow / unfollow workflows.
@@ -39,7 +53,7 @@
   /* ------------------------------------------------------------------ */
   if (window.SA_Automator) return; // Prevent double injection.
 
-  const VERSION = '2.5';
+  const VERSION = '2.6';
   const TITLE = 'Instagram Automator v' + VERSION;
 
   /* ------------------------------------------------------------------ */
