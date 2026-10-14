@@ -142,6 +142,7 @@ Under the Advanced drawer:
 - **Batch Delay:** how long that pause is, in seconds.
 - **Show debug logs:** verbose output. Adds API pagination details, stall events and target parsing to the log. Off by default.
 - **Whitelist / Blacklist inputs:** type one or more usernames (separated by spaces or commas). `+ Whitelist` protects them from unfollows, `+ Blacklist` stops the follow loop from ever following them. The `−` button next to each removes the names you typed from that list. The counts are shown above the inputs.
+- **Reset follow ages:** marks everyone you follow right now as older than 24 hours, so non-followers among them can be unfollowed immediately. Use it when the log shows people stuck in `SKIP (cooldown ...)`. Accounts you follow afterwards still get the 24-hour wait. Sync Following first.
 - **Export / Clear Blacklist:** downloads the blacklist as JSON, and optionally wipes it.
 
 ## Data it stores

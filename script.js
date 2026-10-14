@@ -269,6 +269,25 @@
       writeJSON(KEYS.followingSeen, seen);
     },
 
+    // Treat everyone currently followed as old enough to unfollow. Follow
+    // and request records keep a (tiny) timestamp so the follow loop still
+    // knows they were followed. Returns how many accounts were reset.
+    resetFollowAges() {
+      const following = Store.getMyFollowing();
+      const seen = {};
+      for (const u of following) seen[u] = 0;
+      writeJSON(KEYS.followingSeen, seen);
+      const h = Store.getHistory();
+      const p = Store.getPendingRequests();
+      for (const u of following) {
+        if (typeof h[u] === 'number') h[u] = 1;
+        if (typeof p[u] === 'number') p[u] = 1;
+      }
+      writeJSON(KEYS.history, h);
+      writeJSON(KEYS.pending, p);
+      return following.size;
+    },
+
     getLastSync() {
       const obj = readJSON(KEYS.lastSync, {});
       return obj && typeof obj === 'object' ? obj : {};
@@ -497,6 +516,17 @@
       blackBtn = mkButton('[Export / Clear Blacklist]', '#334155');
       style(blackBtn, { width: '100%' });
 
+      const resetAgesBtn = mkButton('[Reset follow ages]', '#334155');
+      style(resetAgesBtn, { width: '100%', marginTop: '6px' });
+      resetAgesBtn.title = 'Skip the 24h cooldown for everyone you follow right now';
+      resetAgesBtn.addEventListener('click', function () {
+        const n = Store.getMyFollowing().size;
+        if (!n) { log('Sync your Following list first.'); return; }
+        if (!confirm('Mark all ' + n + ' accounts you follow as older than ' + CONFIG.unfollowCooldownHours +
+          'h? Non-followers among them become eligible for unfollow right away. Later follows still get the cooldown.')) return;
+        log('Follow ages reset for ' + Store.resetFollowAges() + ' accounts. The ' + CONFIG.unfollowCooldownHours + 'h cooldown no longer applies to them.');
+      });
+
       settingsBox = buildSettingsBox();
 
       /* ---- manual blacklist / whitelist (by username) ---- */
@@ -514,6 +544,7 @@
       advancedBox.appendChild(settingsToggle);
       advancedBox.appendChild(settingsBox);
       advancedBox.appendChild(blackBtn);
+      advancedBox.appendChild(resetAgesBtn);
       advancedBox.appendChild(advancedRow);
       advancedBox.appendChild(listsLine);
       advancedBox.appendChild(wlWrap);
@@ -1901,6 +1932,29 @@
       return out;
     },
 
+    // Groups every non-follower in Following by verdict, so a short run
+    // explains itself: who is eligible and why everyone else is skipped.
+    logEligibilityBreakdown(ctx) {
+      const groups = {};
+      let total = 0;
+      for (const u of ctx.following) {
+        if (ctx.followers.has(u)) continue;
+        total++;
+        const v = Automator.unfollowVerdict(u, ctx);
+        let key = v.ok ? 'ELIGIBLE' : v.why;
+        if (/^SKIP \(followed \d+h ago/.test(key)) {
+          const source = ctx.history[u] ? 'script follow' : ctx.pending[u] ? 'pending request' : 'first seen in a Following sync';
+          key = 'SKIP (cooldown ' + CONFIG.unfollowCooldownHours + 'h, clock from ' + source + ')';
+        }
+        (groups[key] = groups[key] || []).push(u);
+      }
+      UI.log('Non-followers in your synced Following: ' + total);
+      for (const key of Object.keys(groups)) {
+        const names = groups[key];
+        UI.log('  ' + key + ': ' + names.length + ' -> ' + names.slice(0, 15).join(', ') + (names.length > 15 ? ', ...' : ''));
+      }
+    },
+
     remainingTargets(processed) {
       const left = [];
       for (const u of Automator.eligibleTargets(Automator.unfollowContext())) {
@@ -2049,6 +2103,7 @@
       // processed: usernames already inspected during this run.
       const state = { processed: new Set(), actionCount: 0 };
 
+      Automator.logEligibilityBreakdown(Automator.unfollowContext());
       const eligible = Automator.eligibleTargets(Automator.unfollowContext()).size;
       UI.log('Eligible for unfollow (no follow-back, followed >' + CONFIG.unfollowCooldownHours + 'h ago, not whitelisted): ' + eligible);
 
